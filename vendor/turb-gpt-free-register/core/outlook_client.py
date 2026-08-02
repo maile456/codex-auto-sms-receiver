@@ -5,11 +5,11 @@ Outlook 邮箱客户端（mail.chatai.codes 双协议）
 账号文件格式（每行一个）：
     # 4 段格式（基础）
     email----password----clientId----refreshToken
-    例：SorenBarrett5150@outlook.com----oc621409----9e5f94bc-...----M.C529_...
+    例：user@example.com----PASSWORD----CLIENT_ID----REFRESH_TOKEN
 
     # 6 段格式（带恢复信息）
     email----password----clientId----refreshToken----recoveryEmail----recoveryCode
-    例：ChristinLeno5020@outlook.com----3qP3kEjF----9e5f94bc-...----M.C506_...----Dy9bOAnUd@wmhotmail.com----zf4rBS
+    例：user@example.com----PASSWORD----CLIENT_ID----REFRESH_TOKEN----recovery@example.com----RECOVERY_CODE
 
 工作流：
     1. pick_account()       从根目录 `用于注册的邮箱.json` 中挑一个未用过的账号

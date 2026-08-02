@@ -149,6 +149,23 @@ def test_export_original_preserves_each_import_format_and_delete_many(workspace_
     assert len(store.list_accounts()) == 1
 
 
+def test_reveal_original_returns_one_explicit_reimportable_line(workspace_path: Path):
+    store = MailboxStore(workspace_path)
+    material = "owner@example.com----https://mail.test/code?id=fixture"
+    store.import_text("code_url", material)
+    account_id = store.list_accounts()[0]["id"]
+
+    revealed = store.reveal_original(account_id)
+
+    assert revealed == {
+        "id": account_id,
+        "email": "owner@example.com",
+        "source": "code_url",
+        "material": material,
+    }
+    assert "material" not in store.list_accounts()[0]
+
+
 @pytest.mark.parametrize(
     "material",
     [
@@ -195,3 +212,43 @@ def test_public_account_exposes_credential_presence_not_path(workspace_path: Pat
     assert public["phone_number"] == "+84123456789"
     assert public["codex_status"] == "failed"
     assert "credential_path" not in public
+
+
+def test_sale_status_can_be_marked_and_restored(workspace_path: Path):
+    store = MailboxStore(workspace_path)
+    store.import_text("code_url", "owner@example.com----https://mail.test/code")
+    account_id = store.list_accounts()[0]["id"]
+
+    assert store.list_accounts()[0]["sale_status"] == "unsold"
+    assert store.update_sale_status([account_id], status="sold", note="order-100") == 1
+    sold = store.list_accounts()[0]
+    assert sold["sale_status"] == "sold"
+    assert sold["sold_at"]
+    assert sold["sale_note"] == "order-100"
+
+    store.update_sale_status([account_id], status="unsold")
+    restored = store.list_accounts()[0]
+    assert restored["sale_status"] == "unsold"
+    assert restored["sold_at"] is None
+    assert restored["sale_note"] == ""
+
+
+def test_inventory_export_history_counts_each_successful_export(workspace_path: Path):
+    store = MailboxStore(workspace_path)
+    store.import_text("code_url", "owner@example.com----https://mail.test/code")
+    account_id = store.list_accounts()[0]["id"]
+
+    assert store.list_accounts()[0]["export_count"] == 0
+    assert store.record_exports([account_id]) == 1
+    first = store.list_accounts()[0]
+    assert first["export_count"] == 1
+    assert first["first_exported_at"]
+    assert first["last_exported_at"] == first["first_exported_at"]
+    assert first["sale_status"] == "unsold"
+
+    assert store.record_exports([account_id], mark_sold=True) == 1
+    second = store.list_accounts()[0]
+    assert second["export_count"] == 2
+    assert second["last_exported_at"]
+    assert second["sale_status"] == "sold"
+    assert second["sold_at"]

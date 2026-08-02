@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import re
@@ -181,6 +183,50 @@ def _inside(root: Path, candidate: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _safe_oauth_metadata(payload: dict[str, Any]) -> dict[str, str]:
+    """Extract display-only OAuth metadata without returning any token value."""
+
+    auth: dict[str, Any] = {}
+    for token_key in ("id_token", "access_token"):
+        token = str(payload.get(token_key) or "")
+        parts = token.split(".")
+        if len(parts) < 2 or len(parts[1]) > 128 * 1024:
+            continue
+        try:
+            encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            continue
+        if not isinstance(claims, dict):
+            continue
+        candidate = claims.get("https://api.openai.com/auth")
+        if isinstance(candidate, dict):
+            auth = candidate
+            break
+
+    plan_type = str(auth.get("chatgpt_plan_type") or payload.get("plan_type") or "").strip()
+    active_until = str(auth.get("chatgpt_subscription_active_until") or "").strip()
+    if active_until:
+        try:
+            parsed = datetime.fromisoformat(active_until.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                active_until = ""
+        except ValueError:
+            active_until = ""
+    account_id = str(
+        payload.get("account_id") or auth.get("chatgpt_account_id") or ""
+    ).strip()
+    if len(account_id) > 14:
+        account_hint = f"{account_id[:8]}…{account_id[-4:]}"
+    else:
+        account_hint = account_id
+    return {
+        "plan_type": plan_type[:40],
+        "subscription_active_until": active_until[:80],
+        "account_hint": account_hint[:40],
+    }
 
 
 def _redact_log_text(value: str) -> str:
@@ -715,6 +761,9 @@ class ArtifactStore:
                 "has_refresh_token": False,
                 "has_id_token": False,
                 "exportable": False,
+                "plan_type": "",
+                "subscription_active_until": "",
+                "account_hint": "",
             }
         if not isinstance(payload, dict):
             payload = {}
@@ -733,6 +782,7 @@ class ArtifactStore:
             kind = "record"
         email = str(payload.get("email") or "").strip()[:320]
         expired = str(payload.get("expired") or payload.get("expires_at") or "").strip()[:80]
+        oauth_metadata = _safe_oauth_metadata(payload)
         return {
             "kind": kind,
             "email": email,
@@ -741,6 +791,7 @@ class ArtifactStore:
             "has_refresh_token": refresh,
             "has_id_token": id_token,
             "exportable": kind == "credential" and has_token,
+            **oauth_metadata,
         }
 
     def list_credentials(self) -> list[dict[str, Any]]:

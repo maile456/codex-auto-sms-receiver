@@ -720,6 +720,53 @@ def _extract_totp_factor_id(*payloads: dict) -> str:
     return ""
 
 
+def _normalize_flow_page_type(value) -> str:
+    """Normalize auth page names so API variants share the same branch keys."""
+    return str(value or "").strip().lower().replace("-", "_").replace("/", "_").replace(" ", "_")
+
+
+def _flow_page_type(payload: dict | None) -> str:
+    """Extract the current auth page from authorize/continue-style responses."""
+    if not isinstance(payload, dict):
+        return ""
+
+    containers = [payload]
+    nested_data = payload.get("data")
+    if isinstance(nested_data, dict):
+        containers.append(nested_data)
+
+    urls = []
+    for container in containers:
+        page = container.get("page")
+        if isinstance(page, dict):
+            page_type = _normalize_flow_page_type(page.get("type"))
+            if page_type:
+                return page_type
+            page_payload = page.get("payload")
+            if isinstance(page_payload, dict):
+                urls.append(page_payload.get("url"))
+
+        page_type = _normalize_flow_page_type(container.get("page_type"))
+        if page_type:
+            return page_type
+        urls.extend(
+            container.get(key)
+            for key in ("continue_url", "redirect_url", "url", "next", "location")
+        )
+
+    target = " ".join(str(url or "").lower() for url in urls if url)
+    if "log-in/password" in target or "login/password" in target:
+        return "login_password"
+    if "email-verification" in target or "email-otp" in target:
+        return "email_otp_verification"
+    return ""
+
+
+def _is_login_password_flow(payload: dict | None) -> bool:
+    """Return True when the server expects a password or a passwordless choice."""
+    return _flow_page_type(payload) == "login_password"
+
+
 def _post_json(session: BrowserSession, url: str, payload: dict, referer: str,
                sentinel_header: str | None = None, so_header: str | None = None):
     """统一发 /api/accounts/* 的 JSON POST。"""
@@ -836,6 +883,29 @@ def _submit_email(session: BrowserSession, email: str) -> dict:
         )
     logger.info("[Codex] 已提交邮箱")
     return _resp_json(resp)
+
+
+def _send_passwordless_email_otp(session: BrowserSession) -> dict:
+    """Switch a login-password flow to email OTP without requiring a password."""
+    url = "https://auth.openai.com/api/accounts/passwordless/send-otp"
+    headers = session.get_auth_headers(referer="https://auth.openai.com/log-in/password")
+    resp = session.post(url, headers=headers, data="", allow_redirects=False)
+    if resp.status_code not in (200, 204):
+        error_code = _extract_error_code(resp)
+        if error_code in ("account_deactivated", "account_deleted", "account_banned"):
+            raise AccountUnusableError(
+                f"[Codex] 账号已废（{error_code}）status={resp.status_code}",
+                error_code=error_code,
+            )
+        raise RuntimeError(
+            f"[Codex] 切换邮箱验证码登录失败 status={resp.status_code}: {(resp.text or '')[:300]}"
+        )
+    payload = _resp_json(resp)
+    logger.info(
+        "[Codex] 已从密码页切换到邮箱验证码登录%s",
+        f"，下一状态={_flow_page_type(payload)}" if _flow_page_type(payload) else "",
+    )
+    return payload
 
 
 def _submit_password(session: BrowserSession, password: str) -> dict:
@@ -1496,7 +1566,7 @@ def run_codex_oauth(
 
         # 3. 提交邮箱，按账号素材选择邮箱 OTP 或密码 + TOTP 登录。
         otp_after_ts = time.time()
-        _submit_email(session, email)
+        email_flow = _submit_email(session, email)
         human_delay("form")
 
         if password_totp_login:
@@ -1509,6 +1579,20 @@ def run_codex_oauth(
             _submit_mfa_totp(session, totp_code, factor_id)
             human_delay("api")
         else:
+            passwordless_email_otp = _is_login_password_flow(email_flow)
+            if passwordless_email_otp:
+                # Existing accounts commonly land on /log-in/password. The UI's
+                # "use a verification code" action maps to this protocol call.
+                otp_after_ts = time.time()
+                _send_passwordless_email_otp(session)
+                human_delay("api")
+            else:
+                detected_page = _flow_page_type(email_flow)
+                logger.info(
+                    "[Codex] 提交邮箱后的协议状态=%s，继续等待邮箱 OTP",
+                    detected_page or "unknown",
+                )
+
             # 4. 收邮箱 OTP + 提交；若一直未收到，协议模式下重新提交邮箱触发重发。
             email_otp = None
             try:
@@ -1527,14 +1611,20 @@ def run_codex_oauth(
                     if email_otp_attempt >= max_email_otp_attempts:
                         raise
                     logger.warning(
-                        "[Codex] 一直未收到邮箱 OTP，重新提交邮箱触发重发后继续等待（下一轮 %s/%s）：%s: %s",
+                        "[Codex] 一直未收到邮箱 OTP，重新触发验证码发送后继续等待（下一轮 %s/%s）：%s: %s",
                         email_otp_attempt + 1,
                         max_email_otp_attempts,
                         type(exc).__name__,
                         str(exc)[:180],
                     )
                     otp_after_ts = time.time()
-                    _submit_email(session, email)
+                    if passwordless_email_otp:
+                        _send_passwordless_email_otp(session)
+                    else:
+                        retry_flow = _submit_email(session, email)
+                        if _is_login_password_flow(retry_flow):
+                            passwordless_email_otp = True
+                            _send_passwordless_email_otp(session)
                     human_delay("api")
             logger.info("[Codex] 邮箱 OTP 已收到")
             human_delay("otp_input")

@@ -64,6 +64,7 @@ class CodexJobManager:
         self._task_queue = None
         self._result_queue = None
         self._workers: list[Any] = []
+        self._pipeline_threads: dict[str, threading.Thread] = {}
         self._load_state()
         self._recover_interrupted()
 
@@ -141,9 +142,31 @@ class CodexJobManager:
 
     def _recover_interrupted(self) -> None:
         changed = False
+        paused_to_restore: list[tuple[str, int, dict[str, dict[str, Any]]]] = []
         with self._lock:
+            paused_pipeline_ids = {
+                str(pipeline_id)
+                for pipeline_id, pipeline in self._pipelines.items()
+                if str(pipeline.get("status") or "") == "paused"
+            }
             for job in self._jobs.values():
-                if str(job.get("status") or "") in self._ACTIVE_JOBS:
+                status = str(job.get("status") or "")
+                pipeline_id = str(job.get("pipeline_id") or "")
+                if pipeline_id in paused_pipeline_ids and status in self._ACTIVE_JOBS:
+                    if status == "running":
+                        job.update(
+                            status="retry_wait",
+                            stage="暂停中",
+                            message="服务重启后已放回暂停队列，继续流水线时会重新执行",
+                            failure_code="service_restarted_paused",
+                            retryable=True,
+                            next_retry_at=_now(),
+                            started_at=None,
+                            finished_at=None,
+                        )
+                        changed = True
+                    continue
+                if status in self._ACTIVE_JOBS:
                     job.update(
                         status="failed",
                         stage="服务已重启",
@@ -154,7 +177,33 @@ class CodexJobManager:
                         finished_at=_now(),
                     )
                     changed = True
-            for pipeline in self._pipelines.values():
+            for pipeline_id, pipeline in self._pipelines.items():
+                if str(pipeline.get("status") or "") == "paused":
+                    pipeline.update(pause_requested=True, finished_at=None)
+                    mailboxes = {}
+                    for job_id in pipeline.get("job_ids") or []:
+                        job = self._jobs.get(str(job_id))
+                        if not job or str(job.get("status") or "") not in self._ACTIVE_JOBS:
+                            continue
+                        mailbox = self.mailbox_store.get_secret(email=str(job.get("email") or ""))
+                        if mailbox is not None:
+                            mailboxes[str(job_id)] = mailbox
+                        else:
+                            job.update(
+                                status="failed",
+                                stage="登录素材不存在",
+                                message="服务重启后未找到账号登录素材",
+                                failure_code="mailbox_missing",
+                                retryable=False,
+                                next_retry_at=None,
+                                finished_at=_now(),
+                            )
+                            changed = True
+                    if mailboxes:
+                        paused_to_restore.append(
+                            (str(pipeline_id), int(pipeline.get("concurrency") or 1), mailboxes)
+                        )
+                    continue
                 if str(pipeline.get("status") or "") in self._ACTIVE_PIPELINES:
                     pipeline.update(status="interrupted", finished_at=_now())
                     changed = True
@@ -168,6 +217,21 @@ class CodexJobManager:
                         status="failed",
                         message="服务重启中断了上一次任务",
                     )
+        for pipeline_id, concurrency, mailboxes in paused_to_restore:
+            self._ensure_workers(concurrency)
+            self._launch_pipeline_thread(pipeline_id, mailboxes)
+
+    def _launch_pipeline_thread(
+        self, pipeline_id: str, mailboxes: dict[str, dict[str, Any]]
+    ) -> None:
+        thread = threading.Thread(
+            target=self._run_pipeline,
+            args=(pipeline_id, mailboxes),
+            name=f"codex-pipeline-{pipeline_id[:8]}",
+            daemon=True,
+        )
+        self._pipeline_threads[pipeline_id] = thread
+        thread.start()
 
     def _public_job(self, item: dict) -> dict:
         row = deepcopy(item)
@@ -357,12 +421,7 @@ class CodexJobManager:
             self._persist_locked()
             public = self._pipeline_public_locked(self._pipelines[pipeline_id])
 
-        threading.Thread(
-            target=self._run_pipeline,
-            args=(pipeline_id, job_mailboxes),
-            name=f"codex-pipeline-{pipeline_id[:8]}",
-            daemon=True,
-        ).start()
+        self._launch_pipeline_thread(pipeline_id, job_mailboxes)
         return public
 
     def _ensure_workers(self, count: int) -> None:
@@ -685,6 +744,32 @@ class CodexJobManager:
             )
             self._persist_locked()
             return True
+
+    def set_pipeline_concurrency(self, pipeline_id: str, concurrency: int) -> dict[str, Any] | None:
+        """Resize an active pipeline; already-running jobs are left untouched."""
+
+        try:
+            concurrency = int(concurrency)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("任务并发必须是整数") from exc
+        if concurrency < 1 or concurrency > self._MAX_CONCURRENCY:
+            raise ValueError(f"任务并发必须在 1 - {self._MAX_CONCURRENCY} 之间")
+
+        with self._lock:
+            pipeline = self._pipelines.get(str(pipeline_id or ""))
+            if not pipeline or str(pipeline.get("status") or "") not in self._ACTIVE_PIPELINES:
+                return None
+
+        # Scaling up must provision the extra worker before the scheduler sees
+        # the larger slot count. Scaling down simply limits future dispatches.
+        self._ensure_workers(concurrency)
+        with self._lock:
+            pipeline = self._pipelines.get(str(pipeline_id or ""))
+            if not pipeline or str(pipeline.get("status") or "") not in self._ACTIVE_PIPELINES:
+                return None
+            pipeline["concurrency"] = concurrency
+            self._persist_locked()
+            return self._pipeline_public_locked(pipeline)
 
     def resume_pipeline(self, pipeline_id: str) -> bool:
         """Resume dispatching queued and retry-wait jobs in a paused pipeline."""

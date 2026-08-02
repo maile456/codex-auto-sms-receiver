@@ -244,6 +244,41 @@ def test_pipeline_pause_finishes_inflight_and_resume_dispatches_queue(tmp_path: 
     assert manager.resume_pipeline(pipeline["id"]) is False
 
 
+def test_active_pipeline_can_scale_concurrency_for_queued_jobs(tmp_path: Path):
+    mailbox_store, emails = _mailboxes(tmp_path, count=3)
+    manager = CodexJobManager(_settings(tmp_path), mailbox_store)
+    manager.availability = lambda: {"available": True, "reason": ""}
+    release = threading.Event()
+    started: list[str] = []
+    started_lock = threading.Lock()
+
+    def handler(task):
+        with started_lock:
+            started.append(task["mailbox"]["email"])
+        assert release.wait(timeout=3)
+        return {
+            "dispatch_id": task["dispatch_id"],
+            "job_id": task["job_id"],
+            "attempt": task["attempt"],
+            "result": {"ok": True, "status": "success", "message": "done"},
+        }
+
+    _install_fake_workers(manager, handler=handler, worker_count=2)
+    pipeline = manager.start_batch(emails, concurrency=1)
+    _wait_for(lambda: len(started) == 1)
+
+    resized = manager.set_pipeline_concurrency(pipeline["id"], 2)
+    assert resized is not None
+    assert resized["concurrency"] == 2
+    _wait_for(lambda: len(started) == 2)
+    assert manager.pipeline_overview(pipeline["id"])["counts"]["running"] == 2
+    with pytest.raises(ValueError, match="并发"):
+        manager.set_pipeline_concurrency(pipeline["id"], 4)
+
+    release.set()
+    _wait_for(lambda: not manager.pipeline_overview(pipeline["id"])["active"])
+
+
 def test_pipeline_rejects_unsafe_limits_and_second_active_batch(tmp_path: Path):
     mailbox_store, emails = _mailboxes(tmp_path, count=1)
     manager = CodexJobManager(_settings(tmp_path), mailbox_store)
@@ -337,6 +372,54 @@ def test_pipeline_state_recovers_interrupted_jobs_after_restart(tmp_path: Path):
     assert job["status"] == "failed"
     assert job["failure_code"] == "service_restarted"
     assert mailbox_store.list_accounts()[0]["codex_status"] == "failed"
+
+
+def test_paused_pipeline_survives_restart_and_can_be_resumed(monkeypatch, tmp_path: Path):
+    mailbox_store, emails = _mailboxes(tmp_path, count=1)
+    state = {
+        "version": 1,
+        "pipelines": {
+            "pipeline-paused": {
+                "id": "pipeline-paused",
+                "status": "paused",
+                "pause_requested": True,
+                "concurrency": 1,
+                "retry_limit": 1,
+                "job_ids": ["job-paused"],
+                "created_at": "2026-07-29T00:00:00+00:00",
+            }
+        },
+        "jobs": {
+            "job-paused": {
+                "id": "job-paused",
+                "pipeline_id": "pipeline-paused",
+                "email": emails[0],
+                "status": "running",
+                "attempt": 1,
+                "max_attempts": 2,
+                "created_at": "2026-07-29T00:00:00+00:00",
+                "log_paths": [],
+            }
+        },
+    }
+    path = tmp_path / "data" / "pipeline-state.json"
+    path.write_text(json.dumps(state), encoding="utf-8")
+    launched = []
+    monkeypatch.setattr(CodexJobManager, "_ensure_workers", lambda self, count: None)
+    monkeypatch.setattr(
+        CodexJobManager,
+        "_launch_pipeline_thread",
+        lambda self, pipeline_id, mailboxes: launched.append((pipeline_id, mailboxes)),
+    )
+
+    manager = CodexJobManager(_settings(tmp_path), mailbox_store)
+
+    assert manager.pipeline_overview("pipeline-paused")["status"] == "paused"
+    job = manager.list_jobs()[0]
+    assert job["status"] == "retry_wait"
+    assert job["failure_code"] == "service_restarted_paused"
+    assert launched[0][0] == "pipeline-paused"
+    assert launched[0][1]["job-paused"]["email"] == emails[0]
 
 
 def test_public_job_ignores_deleted_or_outside_log_paths(tmp_path: Path):

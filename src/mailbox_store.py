@@ -95,6 +95,10 @@ class MailboxStore:
             otp_ready = bool(record.get("password") and record.get("totp_secret"))
         else:
             otp_ready = bool(record.get("client_id") and record.get("refresh_token"))
+        try:
+            export_count = max(0, int(record.get("export_count") or 0))
+        except (TypeError, ValueError):
+            export_count = 0
         return {
             "id": record.get("id"),
             "email": record.get("email"),
@@ -108,6 +112,12 @@ class MailboxStore:
             "phone_verified": bool(record.get("phone_verified")),
             "phone_number": str(record.get("phone_number") or ""),
             "phone_verified_at": record.get("phone_verified_at"),
+            "sale_status": "sold" if record.get("sale_status") == "sold" else "unsold",
+            "sold_at": record.get("sold_at"),
+            "sale_note": str(record.get("sale_note") or "")[:200],
+            "export_count": export_count,
+            "first_exported_at": record.get("first_exported_at"),
+            "last_exported_at": record.get("last_exported_at"),
         }
 
     def list_accounts(self) -> list[dict]:
@@ -220,6 +230,12 @@ class MailboxStore:
                     "codex_status": "",
                     "codex_message": "",
                     "credential_path": None,
+                    "sale_status": "unsold",
+                    "sold_at": None,
+                    "sale_note": "",
+                    "export_count": 0,
+                    "first_exported_at": None,
+                    "last_exported_at": None,
                 }
                 for key in (
                     "password",
@@ -240,6 +256,64 @@ class MailboxStore:
                     inserted += 1
             self._write(records)
         return {"parsed": len(parsed), "inserted": inserted, "updated": updated, "invalid": invalid}
+
+    def update_sale_status(
+        self,
+        account_ids: list[str],
+        *,
+        status: str,
+        note: str = "",
+    ) -> int:
+        normalized = list(dict.fromkeys(str(value or "").strip() for value in account_ids))
+        if not normalized or any(not value for value in normalized):
+            raise ValueError("请至少选择一个账号")
+        sale_status = str(status or "").strip().lower()
+        if sale_status not in {"sold", "unsold"}:
+            raise ValueError("销售状态仅支持 sold / unsold")
+        sale_note = str(note or "").strip()
+        if len(sale_note) > 200 or any(ord(char) < 32 for char in sale_note):
+            raise ValueError("销售备注不能超过 200 字且不能包含控制字符")
+        with self._lock:
+            records = self._read()
+            if any(value not in records for value in normalized):
+                raise KeyError("所选账号不存在")
+            now = _now()
+            for account_id in normalized:
+                record = records[account_id]
+                record["sale_status"] = sale_status
+                record["sold_at"] = now if sale_status == "sold" else None
+                record["sale_note"] = sale_note if sale_status == "sold" else ""
+                record["updated_at"] = now
+            self._write(records)
+        return len(normalized)
+
+    def record_exports(self, account_ids: list[str], *, mark_sold: bool = False) -> int:
+        """Atomically increment per-account inventory export history."""
+
+        normalized = list(dict.fromkeys(str(value or "").strip() for value in account_ids))
+        if not normalized or any(not value for value in normalized):
+            raise ValueError("请至少选择一个账号")
+        with self._lock:
+            records = self._read()
+            if any(value not in records for value in normalized):
+                raise KeyError("所选账号不存在")
+            now = _now()
+            for account_id in normalized:
+                record = records[account_id]
+                try:
+                    previous = max(0, int(record.get("export_count") or 0))
+                except (TypeError, ValueError):
+                    previous = 0
+                record["export_count"] = previous + 1
+                if previous == 0 or not record.get("first_exported_at"):
+                    record["first_exported_at"] = now
+                record["last_exported_at"] = now
+                if mark_sold:
+                    record["sale_status"] = "sold"
+                    record["sold_at"] = now
+                record["updated_at"] = now
+            self._write(records)
+        return len(normalized)
 
     @staticmethod
     def _original_material(record: Mapping) -> str:
@@ -303,6 +377,23 @@ class MailboxStore:
                 source = str(record.get("source") or "unknown").strip().lower()
                 grouped.setdefault(source, []).append(self._original_material(record))
             return grouped
+
+    def reveal_original(self, account_id: str) -> dict:
+        """Return one re-importable source line only for an explicit reveal request."""
+
+        normalized = str(account_id or "").strip()
+        if not normalized:
+            raise ValueError("账号 ID 不能为空")
+        with self._lock:
+            record = self._read().get(normalized)
+            if record is None:
+                raise KeyError("账号不存在")
+            return {
+                "id": normalized,
+                "email": str(record.get("email") or ""),
+                "source": str(record.get("source") or "unknown"),
+                "material": self._original_material(record),
+            }
 
     def delete_many(self, account_ids: list[str]) -> int:
         normalized = list(dict.fromkeys(str(value or "").strip() for value in account_ids))

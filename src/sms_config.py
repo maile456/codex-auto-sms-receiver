@@ -145,6 +145,9 @@ class SmsConfigStore:
         "SMS_MAX_PRICE",
         "SMS_MAX_RETRIES",
         "SMS_CODE_WAIT",
+        "GENERIC_API_OTP_MAX_WAIT",
+        "GENERIC_API_OTP_POLL_INTERVAL",
+        "GENERIC_API_OTP_ATTEMPTS",
         # Hero-owned settings.
         "HERO_SMS_API_KEY",
         "HERO_SMS_COUNTRIES",
@@ -208,6 +211,11 @@ class SmsConfigStore:
             "reuse_enabled": _stored_boolean(values["HERO_SMS_REUSE_ENABLED"], False),
             "max_retries": _stored_integer(values["SMS_MAX_RETRIES"], 10),
             "code_wait": _stored_integer(values["SMS_CODE_WAIT"], 30),
+            "email_otp_wait": _stored_integer(values["GENERIC_API_OTP_MAX_WAIT"], 90),
+            "email_otp_poll_interval": _stored_integer(
+                values["GENERIC_API_OTP_POLL_INTERVAL"], 3
+            ),
+            "email_otp_attempts": _stored_integer(values["GENERIC_API_OTP_ATTEMPTS"], 1),
             "credential_configured": configured,
             # Kept as a one-item object for older local UI/API consumers.
             "credentials_configured": {"hero": configured},
@@ -307,6 +315,33 @@ class SmsConfigStore:
                 field="短信等待秒数",
                 minimum=30,
                 maximum=600,
+            ),
+            "GENERIC_API_OTP_MAX_WAIT": _integer(
+                payload.get(
+                    "email_otp_wait",
+                    current["GENERIC_API_OTP_MAX_WAIT"] or 90,
+                ),
+                field="邮箱验证码单轮等待秒数",
+                minimum=30,
+                maximum=300,
+            ),
+            "GENERIC_API_OTP_POLL_INTERVAL": _integer(
+                payload.get(
+                    "email_otp_poll_interval",
+                    current["GENERIC_API_OTP_POLL_INTERVAL"] or 3,
+                ),
+                field="邮箱验证码轮询间隔",
+                minimum=1,
+                maximum=30,
+            ),
+            "GENERIC_API_OTP_ATTEMPTS": _integer(
+                payload.get(
+                    "email_otp_attempts",
+                    current["GENERIC_API_OTP_ATTEMPTS"] or 1,
+                ),
+                field="邮箱验证码重试轮数",
+                minimum=1,
+                maximum=5,
             ),
             "HERO_SMS_COUNTRIES": ",".join(countries),
             "HERO_SMS_MIN_PRICE": min_price,

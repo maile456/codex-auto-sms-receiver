@@ -16,6 +16,9 @@ SMS_ENV_KEYS = (
     "SMS_MAX_PRICE",
     "SMS_MAX_RETRIES",
     "SMS_CODE_WAIT",
+    "GENERIC_API_OTP_MAX_WAIT",
+    "GENERIC_API_OTP_POLL_INTERVAL",
+    "GENERIC_API_OTP_ATTEMPTS",
     "HERO_SMS_API_KEY",
     "HERO_SMS_COUNTRIES",
     "HERO_SMS_MIN_PRICE",
@@ -74,6 +77,20 @@ def test_save_is_atomic_masks_secret_and_forces_hero(tmp_path: Path):
     assert snapshot["credentials_configured"] == {"hero": True}
     assert "hero-secret" not in repr(snapshot)
     assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_email_otp_timing_and_attempts_are_persisted(tmp_path: Path):
+    env_path = tmp_path / ".env"
+    snapshot = SmsConfigStore(env_path).save(
+        _payload(email_otp_wait=180, email_otp_poll_interval=5, email_otp_attempts=3)
+    )
+    values = dotenv_values(env_path)
+    assert snapshot["email_otp_wait"] == 180
+    assert snapshot["email_otp_poll_interval"] == 5
+    assert snapshot["email_otp_attempts"] == 3
+    assert values["GENERIC_API_OTP_MAX_WAIT"] == "180"
+    assert values["GENERIC_API_OTP_POLL_INTERVAL"] == "5"
+    assert values["GENERIC_API_OTP_ATTEMPTS"] == "3"
 
 
 def test_operator_defaults_are_applied_to_empty_hero_settings(tmp_path: Path):

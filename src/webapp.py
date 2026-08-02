@@ -3,8 +3,10 @@ from __future__ import annotations
 import ipaddress
 import io
 import json
+import base64
 import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +14,7 @@ from pathlib import Path
 from flask import Flask, jsonify, redirect, render_template, request, send_file, url_for
 
 from .artifact_store import ArtifactStore, _redact_log_text
+from .codex_quota import CodexQuotaStore, query_codex_quota
 from .hero_catalog import HeroCatalog
 from .hero_pricing import HeroPricingClient, HeroPricingError, filter_price_tiers
 from .mailbox_store import MailboxStore
@@ -29,6 +32,39 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+def _oauth_subscription_metadata(payload: dict) -> dict:
+    """Read plan/subscription dates embedded in a locally stored OAuth JWT."""
+
+    result = {}
+    for token_key in ("id_token", "access_token"):
+        token = str(payload.get(token_key) or "")
+        parts = token.split(".")
+        if len(parts) < 2 or len(parts[1]) > 128 * 1024:
+            continue
+        try:
+            encoded = parts[1] + "=" * (-len(parts[1]) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(claims, dict):
+            continue
+        auth = claims.get("https://api.openai.com/auth")
+        if not isinstance(auth, dict):
+            auth = {}
+        plan_type = str(auth.get("chatgpt_plan_type") or "").strip().lower()
+        if plan_type and "plan_type" not in result:
+            result["plan_type"] = plan_type
+        active_until = str(auth.get("chatgpt_subscription_active_until") or "").strip()
+        if active_until:
+            try:
+                parsed = datetime.fromisoformat(active_until.replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    result["subscription_active_until"] = active_until
+            except ValueError:
+                pass
+    return result
+
+
 def create_app(
     settings: Settings,
     *,
@@ -38,6 +74,7 @@ def create_app(
     hero_catalog=None,
     hero_pricing=None,
     artifact_store=None,
+    quota_store=None,
     **_legacy,
 ) -> Flask:
     if not _is_loopback_host(settings.host):
@@ -54,6 +91,7 @@ def create_app(
     sms_config_store = sms_config_store or SmsConfigStore(settings.project_root / ".env")
     hero_catalog = hero_catalog or HeroCatalog()
     artifact_store = artifact_store or ArtifactStore(settings.data_dir, settings.log_dir)
+    quota_store = quota_store or CodexQuotaStore(settings.data_dir)
     if codex_manager is None:
         from .codex_service import CodexJobManager
 
@@ -134,6 +172,11 @@ def create_app(
             row["credential_id"] = str((credential or {}).get("id") or "")
             row["credential_modified_at"] = (credential or {}).get("modified_at")
             row["credential_expired"] = (credential or {}).get("expired")
+            row["subscription_active_until"] = (credential or {}).get(
+                "subscription_active_until"
+            )
+            row["subscription_plan_type"] = (credential or {}).get("plan_type")
+            row["credential_account_hint"] = (credential or {}).get("account_hint")
             if credential and not row.get("phone_number") and callable(phone_lookup):
                 verified = phone_lookup(str(row.get("id") or "")) or {}
                 row["phone_verified"] = bool(verified.get("phone_number"))
@@ -218,6 +261,19 @@ def create_app(
     @app.get("/api/accounts")
     def list_accounts():
         return jsonify({"ok": True, "accounts": _account_rows()})
+
+    @app.post("/api/accounts/<account_id>/material/reveal")
+    def reveal_account_material(account_id: str):
+        if not _is_loopback_host(settings.host):
+            return jsonify({"ok": False, "error": "原始账号素材仅允许从本机 WebUI 查看"}), 403
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict) or data.get("confirmed") is not True:
+            return jsonify({"ok": False, "error": "查看原始素材前必须明确确认"}), 400
+        try:
+            material = mailbox_store.reveal_original(account_id)
+        except (ValueError, KeyError) as exc:
+            return _selection_error(exc)
+        return jsonify({"ok": True, **material})
 
     @app.get("/api/sms-config")
     def get_sms_config():
@@ -592,7 +648,7 @@ def create_app(
         response.call_on_close(buffer.close)
         return response
 
-    def _selected_credential_files(data) -> list[tuple[Path, str]]:
+    def _selected_credential_files(data, *, max_items: int = 100) -> list[tuple[Path, str]]:
         if not isinstance(data, dict):
             raise ValueError("请提交 JSON 对象")
         if data.get("confirmed") is not True:
@@ -603,8 +659,8 @@ def create_app(
             raise ValueError("凭证和账号 ID 必须使用数组")
         if not credential_ids and not account_ids:
             raise ValueError("请至少选择一个凭证")
-        if len(credential_ids) + len(account_ids) > 100:
-            raise OverflowError("每次最多导出 100 个凭证")
+        if len(credential_ids) + len(account_ids) > max_items:
+            raise OverflowError(f"每次最多导出 {max_items} 个凭证")
         if any(not isinstance(value, str) or not value.strip() for value in credential_ids):
             raise ValueError("凭证 ID 格式无效")
         if any(not isinstance(value, str) or not value.strip() for value in account_ids):
@@ -656,6 +712,7 @@ def create_app(
                 raise ValueError(f"凭证文件读取失败：{path.name}") from exc
             if not isinstance(raw, dict):
                 raise ValueError(f"凭证文件格式无效：{path.name}")
+            subscription = _oauth_subscription_metadata(raw)
             credentials = {}
             for source_key, target_key in (
                 ("access_token", "access_token"),
@@ -668,9 +725,13 @@ def create_app(
                 value = raw.get(source_key)
                 if value is not None and str(value).strip():
                     credentials[target_key] = value
-            expires_at = raw.get("expired") or raw.get("expires_at")
+            expires_at = subscription.get("subscription_active_until") or raw.get(
+                "expired"
+            ) or raw.get("expires_at")
             if expires_at:
                 credentials["expires_at"] = expires_at
+            if not credentials.get("plan_type") and subscription.get("plan_type"):
+                credentials["plan_type"] = subscription["plan_type"]
             raw_type = str(raw.get("type") or "").strip().lower()
             if "plan_type" not in credentials and raw_type in {
                 "free",
@@ -702,6 +763,244 @@ def create_app(
             "proxies": [],
             "accounts": accounts,
         }
+
+    def _original_accounts_download(account_ids: list[str], filename: str):
+        grouped = mailbox_store.export_original(account_ids)
+        buffer = tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024, mode="w+b")
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for source, lines in grouped.items():
+                archive.writestr(f"{source}.txt", ("\n".join(lines) + "\n").encode("utf-8"))
+            archive.writestr(
+                "README.txt",
+                "每个 TXT 文件均保持对应的原导入格式；在 WebUI 选择同名登录素材类型后可直接重新导入。\n".encode(
+                    "utf-8"
+                ),
+            )
+        buffer.seek(0)
+        response = send_file(
+            buffer,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=filename,
+            conditional=False,
+            etag=False,
+            max_age=0,
+        )
+        response.call_on_close(buffer.close)
+        return response
+
+    def _credential_payload_for_account(account_id: str) -> dict:
+        account = mailbox_store.get_secret(account_id=account_id)
+        if account is None:
+            raise KeyError("所选账号不存在")
+        email = str(account.get("email") or "")
+        credential = artifact_store.exportable_credential_for_email(email)
+        if not credential:
+            raise KeyError("所选账号没有可用 OAuth 凭证")
+        path = artifact_store.exportable_credential_file(
+            str(credential.get("id") or ""), expected_email=email
+        )
+        if path is None:
+            raise KeyError("所选账号的 OAuth 凭证不可用")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError("OAuth 凭证文件读取失败") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("OAuth 凭证格式无效")
+        return payload
+
+    @app.get("/api/seller/inventory")
+    def seller_inventory():
+        # Inventory is account-centric: imported accounts remain manageable
+        # before phone verification or OAuth credential creation.
+        accounts = _account_rows()
+        quotas = quota_store.list()
+        for row in accounts:
+            row["quota"] = quotas.get(str(row.get("id") or ""))
+        summary = {
+            "total": len(accounts),
+            "credential_total": sum(bool(row.get("has_credential")) for row in accounts),
+            "unexported": sum(int(row.get("export_count") or 0) == 0 for row in accounts),
+            "exported": sum(int(row.get("export_count") or 0) > 0 for row in accounts),
+            "export_count": sum(int(row.get("export_count") or 0) for row in accounts),
+            "quota_ok": sum((row.get("quota") or {}).get("status") == "ok" for row in accounts),
+            "phone_verified": sum(bool(row.get("phone_verified")) for row in accounts),
+            "phone_unverified": sum(not row.get("phone_verified") for row in accounts),
+        }
+        return jsonify({"ok": True, "accounts": accounts, "summary": summary})
+
+    @app.post("/api/seller/quota/refresh")
+    def refresh_seller_quota():
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
+        if data.get("all") is True:
+            account_ids = [
+                str(row.get("id") or "")
+                for row in _account_rows()
+                if row.get("has_credential")
+            ]
+        else:
+            account_ids = data.get("account_ids")
+        if not isinstance(account_ids, list) or not account_ids:
+            return jsonify({"ok": False, "error": "请至少选择一个账号查询额度"}), 400
+        normalized = list(dict.fromkeys(str(value or "").strip() for value in account_ids))
+        if any(not value for value in normalized):
+            return jsonify({"ok": False, "error": "账号 ID 格式无效"}), 400
+
+        def refresh_one(account_id: str) -> tuple[str, dict]:
+            try:
+                result = query_codex_quota(_credential_payload_for_account(account_id))
+                return account_id, quota_store.put(account_id, result)
+            except Exception as exc:
+                return account_id, quota_store.record_error(account_id, exc)
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(normalized))) as executor:
+            futures = [executor.submit(refresh_one, account_id) for account_id in normalized]
+            for future in as_completed(futures):
+                account_id, result = future.result()
+                results[account_id] = result
+        return jsonify(
+            {
+                "ok": True,
+                "total": len(results),
+                "results": results,
+                "success": sum(item.get("status") == "ok" for item in results.values()),
+                "failed": sum(item.get("status") != "ok" for item in results.values()),
+            }
+        )
+
+    @app.post("/api/seller/export")
+    def export_inventory_accounts():
+        if not _is_loopback_host(settings.host):
+            return jsonify({"ok": False, "error": "账号库存仅允许从本机 WebUI 导出"}), 403
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict) or data.get("confirmed") is not True:
+            return jsonify({"ok": False, "error": "导出前必须明确确认"}), 400
+        export_format = str(data.get("format") or "original").strip().lower()
+        if export_format not in {"original", "codex_json", "sub2api"}:
+            return jsonify({"ok": False, "error": "不支持的账号库存导出格式"}), 400
+
+        inventory = _account_rows()
+        inventory.sort(
+            key=lambda row: str(
+                row.get("credential_modified_at")
+                or row.get("created_at")
+                or row.get("updated_at")
+                or ""
+            )
+        )
+        inventory_by_id = {str(row.get("id") or ""): row for row in inventory}
+        requested_ids = data.get("account_ids")
+        all_unexported = data.get("all_unexported") is True
+
+        if requested_ids is not None:
+            if not isinstance(requested_ids, list) or not requested_ids or len(requested_ids) > 500:
+                return jsonify({"ok": False, "error": "请选择 1 - 500 个库存账号"}), 400
+            normalized = list(dict.fromkeys(str(value or "").strip() for value in requested_ids))
+            if any(not value for value in normalized):
+                return jsonify({"ok": False, "error": "账号 ID 格式无效"}), 400
+            if any(value not in inventory_by_id for value in normalized):
+                return jsonify({"ok": False, "error": "所选库存账号不存在"}), 404
+            selected = [inventory_by_id[value] for value in normalized]
+            name_scope = "selected"
+            export_mode = "selected"
+        elif all_unexported:
+            selected = [row for row in inventory if int(row.get("export_count") or 0) == 0]
+            if export_format != "original":
+                selected = [row for row in selected if row.get("has_credential")]
+            if not selected:
+                return jsonify({"ok": False, "error": "当前没有符合该格式的未导出账号"}), 409
+            if len(selected) > 500:
+                return jsonify({"ok": False, "error": "未导出账号超过 500 个，请分批导出"}), 413
+            name_scope = "all-unexported"
+            export_mode = "all_unexported"
+        else:
+            export_state = str(data.get("export_state") or "unexported").strip().lower()
+            phone_state = str(data.get("phone_state") or "all").strip().lower()
+            if export_state not in {"all", "unexported", "exported"}:
+                return jsonify({"ok": False, "error": "导出状态筛选无效"}), 400
+            if phone_state not in {"all", "verified", "unverified"}:
+                return jsonify({"ok": False, "error": "接码状态筛选无效"}), 400
+            candidates = [
+                row
+                for row in inventory
+                if (
+                    export_state == "all"
+                    or (export_state == "unexported" and int(row.get("export_count") or 0) == 0)
+                    or (export_state == "exported" and int(row.get("export_count") or 0) > 0)
+                )
+                and (
+                    phone_state == "all"
+                    or (phone_state == "verified" and row.get("phone_verified"))
+                    or (phone_state == "unverified" and not row.get("phone_verified"))
+                )
+            ]
+            if export_format != "original":
+                candidates = [row for row in candidates if row.get("has_credential")]
+            try:
+                count = int(data.get("count", 1))
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "导出数量必须是整数"}), 400
+            if count < 1 or count > 100:
+                return jsonify({"ok": False, "error": "每次可导出 1 - 100 个账号"}), 400
+            selected = candidates[:count]
+            if len(selected) < count:
+                return jsonify(
+                    {"ok": False, "error": f"当前筛选及格式下只有 {len(selected)} 个可导出账号"}
+                ), 409
+            name_scope = export_state
+            export_mode = "count"
+
+        if export_format != "original":
+            missing_credentials = [row for row in selected if not row.get("has_credential")]
+            if missing_credentials:
+                return jsonify(
+                    {
+                        "ok": False,
+                        "error": (
+                            f"所选账号中有 {len(missing_credentials)} 个尚无 OAuth 凭证；"
+                            "请改用原导入格式，或只选择已有凭证账号"
+                        ),
+                    }
+                ), 409
+
+        account_ids = [str(row.get("id") or "") for row in selected]
+        try:
+            if export_format == "original":
+                response = _original_accounts_download(
+                    account_ids, f"account-inventory-{name_scope}-original-format.zip"
+                )
+            else:
+                rows = _selected_credential_files(
+                    {"account_ids": account_ids, "credential_ids": [], "confirmed": True},
+                    max_items=500 if all_unexported or requested_ids is not None else 100,
+                )
+                if export_format == "codex_json":
+                    response = _zip_download(
+                        rows, filename=f"account-inventory-{name_scope}-codex-json.zip"
+                    )
+                elif export_format == "sub2api":
+                    content = json.dumps(
+                        _sub2api_payload(rows), ensure_ascii=False, indent=2
+                    ).encode("utf-8") + b"\n"
+                    response = send_file(
+                        io.BytesIO(content),
+                        mimetype="application/json",
+                        as_attachment=True,
+                        download_name=f"account-inventory-{name_scope}-sub2api.json",
+                        conditional=False,
+                        etag=False,
+                        max_age=0,
+                    )
+            mailbox_store.record_exports(account_ids)
+            response.headers["X-Exported-Account-Count"] = str(len(account_ids))
+            response.headers["X-Export-Mode"] = export_mode
+            return response
+        except (ValueError, KeyError, OverflowError) as exc:
+            return _selection_error(exc)
 
     @app.get("/api/artifacts/credentials.zip")
     def download_all_credentials():
@@ -836,31 +1135,55 @@ def create_app(
         if any(not isinstance(value, str) or not value.strip() for value in account_ids):
             return jsonify({"ok": False, "error": "账号 ID 格式无效"}), 400
         try:
-            grouped = mailbox_store.export_original(account_ids)
+            return _original_accounts_download(account_ids, "account-materials-original-format.zip")
         except (ValueError, KeyError) as exc:
             return _selection_error(exc)
-        buffer = tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024, mode="w+b")
-        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for source, lines in grouped.items():
-                content = ("\n".join(lines) + "\n").encode("utf-8")
-                archive.writestr(f"{source}.txt", content)
-            archive.writestr(
-                "README.txt",
-                "每个 TXT 文件均保持对应的原导入格式；在 WebUI 选择同名登录素材类型后可直接重新导入。\n".encode(
-                    "utf-8"
-                ),
+
+    @app.post("/api/accounts/phone-unverified/export")
+    def export_phone_unverified_accounts():
+        if not _is_loopback_host(settings.host):
+            return jsonify({"ok": False, "error": "未接码账号素材仅允许从本机 WebUI 导出"}), 403
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict) or data.get("confirmed") is not True:
+            return jsonify({"ok": False, "error": "导出未接码账号前必须明确确认"}), 400
+        credential_only = data.get("credential_only") is True
+        rows = [
+            row
+            for row in _account_rows()
+            if not row.get("phone_verified")
+            and (not credential_only or row.get("has_credential"))
+        ]
+        rows.sort(key=lambda row: str(row.get("created_at") or row.get("updated_at") or ""))
+        raw_count = data.get("count")
+        if raw_count not in (None, ""):
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "导出数量必须是整数"}), 400
+            if count < 1 or count > 500:
+                return jsonify({"ok": False, "error": "每次可导出 1 - 500 个未接码账号"}), 400
+            if len(rows) < count:
+                return jsonify(
+                    {"ok": False, "error": f"当前未接码账号只有 {len(rows)} 个"}
+                ), 409
+            rows = rows[:count]
+        if not rows:
+            return jsonify({"ok": False, "error": "当前没有未接码账号"}), 409
+        account_ids = [str(row.get("id") or "") for row in rows]
+        try:
+            response = _original_accounts_download(
+                account_ids, "phone-unverified-original-format.zip"
             )
-        buffer.seek(0)
-        response = send_file(
-            buffer,
-            mimetype="application/zip",
-            as_attachment=True,
-            download_name="account-materials-original-format.zip",
-            conditional=False,
-            etag=False,
-            max_age=0,
-        )
-        response.call_on_close(buffer.close)
+        except (ValueError, KeyError) as exc:
+            return _selection_error(exc)
+        response.headers["X-Exported-Account-Count"] = str(len(account_ids))
+        response.headers["X-Account-Phone-Status"] = "unverified"
+        response.headers["X-Account-Scope"] = "seller" if credential_only else "all"
+        if credential_only:
+            try:
+                mailbox_store.record_exports(account_ids)
+            except (ValueError, KeyError) as exc:
+                return _selection_error(exc)
         return response
 
     @app.delete("/api/accounts/selected")
@@ -940,6 +1263,20 @@ def create_app(
             return jsonify({"ok": False, "error": "流水线不存在、已暂停或已结束"}), 409
         return jsonify({"ok": True, "pipeline": _pipeline_overview()})
 
+    @app.post("/api/codex-pipeline/<pipeline_id>/concurrency")
+    def set_codex_pipeline_concurrency(pipeline_id: str):
+        data = request.get_json(silent=True) or {}
+        setter = getattr(codex_manager, "set_pipeline_concurrency", None)
+        if not callable(setter):
+            return jsonify({"ok": False, "error": "当前任务管理器不支持动态调整并发"}), 501
+        try:
+            pipeline = setter(pipeline_id, data.get("concurrency"))
+        except (TypeError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        if pipeline is None:
+            return jsonify({"ok": False, "error": "流水线不存在或已经结束"}), 409
+        return jsonify({"ok": True, "pipeline": pipeline})
+
     @app.post("/api/codex-pipeline/<pipeline_id>/resume")
     def resume_codex_pipeline(pipeline_id: str):
         resumer = getattr(codex_manager, "resume_pipeline", None)
@@ -975,4 +1312,5 @@ def create_app(
     app.extensions["hero_catalog"] = hero_catalog
     app.extensions["hero_pricing"] = hero_pricing
     app.extensions["artifact_store"] = artifact_store
+    app.extensions["quota_store"] = quota_store
     return app

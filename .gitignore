@@ -24,6 +24,8 @@ credentials/
 
 # 本地工具与编辑器
 .pytest_cache/
+.tmp-*/
+artifacts/
 .tmp-pytest*/
 pytest-cache-files-*/
 tests/runtime-*/

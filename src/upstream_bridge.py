@@ -23,6 +23,7 @@ SAFE_DEFAULTS = {
 
 GENERIC_API_OTP_MAX_WAIT_SECONDS = 90
 GENERIC_API_OTP_POLL_INTERVAL_SECONDS = 3
+GENERIC_API_OTP_ATTEMPTS = 1
 
 
 def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -126,9 +127,13 @@ def _generic_api_otp_provider(mailbox: dict) -> tuple[Callable, Callable[[], Non
         )
         return generic_api_mail_client.fetch_latest_otp(target_email, after_ts=after_ts, **kwargs)
 
-    # 上游协议默认会重发邮箱并连续等待三轮。通用 API 取码超时后直接结束，
-    # 后续是否重新跑整个账号由流水线的“失败重试”设置决定。
-    get_otp.codex_max_email_otp_attempts = 1
+    # 每轮都会等待上方 max_wait；允许在 WebUI 中配置是否重发邮箱并再次取码。
+    get_otp.codex_max_email_otp_attempts = _bounded_env_int(
+        "GENERIC_API_OTP_ATTEMPTS",
+        GENERIC_API_OTP_ATTEMPTS,
+        1,
+        5,
+    )
 
     def cleanup() -> None:
         generic_api_mail_client._CONTEXT_CACHE.pop(email, None)

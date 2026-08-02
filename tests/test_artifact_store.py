@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import hashlib
 from pathlib import Path
@@ -7,6 +8,13 @@ from pathlib import Path
 import pytest
 
 from src.artifact_store import ArtifactStore
+
+
+def _unsigned_jwt(claims: dict) -> str:
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(claims, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"header.{encoded}.signature"
 
 
 def test_artifact_index_masks_tokens_and_classifies_files(tmp_path: Path):
@@ -23,7 +31,15 @@ def test_artifact_index_masks_tokens_and_classifies_files(tmp_path: Path):
                 "email": "owner@example.com",
                 "access_token": "access-secret",
                 "refresh_token": secret,
-                "id_token": "id-secret",
+                "id_token": _unsigned_jwt(
+                    {
+                        "https://api.openai.com/auth": {
+                            "chatgpt_account_id": "chatgpt-account-1234567890",
+                            "chatgpt_plan_type": "plus",
+                            "chatgpt_subscription_active_until": "2026-09-02T05:00:00+00:00",
+                        }
+                    }
+                ),
                 "expired": "2026-08-01T00:00:00Z",
             }
         ),
@@ -51,6 +67,12 @@ def test_artifact_index_masks_tokens_and_classifies_files(tmp_path: Path):
     by_name = {item["name"]: item for item in overview["credentials"]}
     assert by_name["codex-owner@example.com.json"]["exportable"] is True
     assert by_name["codex-owner@example.com.json"]["has_refresh_token"] is True
+    assert by_name["codex-owner@example.com.json"]["plan_type"] == "plus"
+    assert (
+        by_name["codex-owner@example.com.json"]["subscription_active_until"]
+        == "2026-09-02T05:00:00+00:00"
+    )
+    assert by_name["codex-owner@example.com.json"]["account_hint"] == "chatgpt-…7890"
     assert by_name["codex-receipt.json"]["kind"] == "receipt"
     assert by_name["broken.json"]["kind"] == "invalid"
     assert "path" not in by_name["codex-owner@example.com.json"]

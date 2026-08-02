@@ -2,6 +2,7 @@ import shutil
 import uuid
 import io
 import json
+import base64
 import re
 import zipfile
 from pathlib import Path
@@ -14,6 +15,14 @@ from src.artifact_store import ArtifactStore
 from src.settings import Settings
 from src.sms_config import SmsConfigStore
 from src.webapp import create_app
+
+
+def _unsigned_jwt(claims: dict) -> str:
+    def encode(value: dict) -> str:
+        raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f"{encode({'alg': 'none'})}.{encode(claims)}.signature"
 
 
 class FakeCodexManager:
@@ -79,6 +88,15 @@ class FakeCodexManager:
         self.pipeline.update(status="paused", active=True)
         return True
 
+    def set_pipeline_concurrency(self, pipeline_id, concurrency):
+        if pipeline_id != self.pipeline.get("id") or not self.pipeline.get("active"):
+            return None
+        concurrency = int(concurrency)
+        if concurrency < 1 or concurrency > 3:
+            raise ValueError("任务并发必须在 1 - 3 之间")
+        self.pipeline["concurrency"] = concurrency
+        return dict(self.pipeline)
+
     def resume_pipeline(self, pipeline_id):
         if pipeline_id != self.pipeline.get("id") or self.pipeline.get("status") != "paused":
             return False
@@ -138,6 +156,214 @@ def test_console_is_available_without_login(workspace_path: Path):
         response = getattr(client, method)(path, follow_redirects=False)
         assert response.status_code == 303
         assert response.headers["Location"].endswith("/")
+
+
+def test_original_account_material_requires_explicit_reveal(workspace_path: Path):
+    client, mailbox, _ = _client(workspace_path)
+    material = "owner@example.com----https://mail.test/code?id=fixture"
+    mailbox.import_text("code_url", material)
+    account = client.get("/api/accounts").get_json()["accounts"][0]
+    assert "material" not in account
+
+    denied = client.post(f"/api/accounts/{account['id']}/material/reveal", json={})
+    assert denied.status_code == 400
+
+    revealed = client.post(
+        f"/api/accounts/{account['id']}/material/reveal", json={"confirmed": True}
+    )
+    assert revealed.status_code == 200
+    assert revealed.get_json()["material"] == material
+
+    html = client.get("/").get_data(as_text=True)
+    assert 'id="materialDialog"' in html
+    assert 'data-account-material="${esc(id)}"' in html
+
+
+def test_phone_status_is_exposed_and_unverified_accounts_export_original_format(
+    workspace_path: Path,
+):
+    client, mailbox, _ = _client(workspace_path)
+    unverified = "waiting@example.com----https://mail.test/waiting"
+    verified = "done@example.com----https://mail.test/done"
+    mailbox.import_text("code_url", f"{unverified}\n{verified}")
+    mailbox.update_codex(
+        "done@example.com",
+        status="success",
+        phone_verified=True,
+        phone_number="+15550000001",
+    )
+
+    accounts = client.get("/api/accounts").get_json()["accounts"]
+    by_email = {row["email"]: row for row in accounts}
+    assert by_email["waiting@example.com"]["phone_verified"] is False
+    assert by_email["done@example.com"]["phone_verified"] is True
+
+    denied = client.post("/api/accounts/phone-unverified/export", json={"count": 1})
+    assert denied.status_code == 400
+    exported = client.post(
+        "/api/accounts/phone-unverified/export",
+        json={"count": 1, "confirmed": True},
+    )
+    assert exported.status_code == 200
+    assert exported.headers["X-Exported-Account-Count"] == "1"
+    assert exported.headers["X-Account-Phone-Status"] == "unverified"
+    assert exported.headers["X-Account-Scope"] == "all"
+    with zipfile.ZipFile(io.BytesIO(exported.data)) as archive:
+        content = archive.read("code_url.txt").decode("utf-8")
+        assert unverified in content
+        assert verified not in content
+
+    html = client.get("/").get_data(as_text=True)
+    assert '<option value="phone_unverified">未接码</option>' in html
+    assert '<option value="phone_verified">已接码</option>' in html
+    assert 'id="sellerExportSelected"' in html
+
+
+def test_seller_inventory_export_status_and_quota(monkeypatch, workspace_path: Path):
+    data_dir = workspace_path / "data"
+    credential_dir = data_dir / "codex_accounts"
+    credential_dir.mkdir(parents=True)
+    mailbox = MailboxStore(data_dir)
+    mailbox.import_text(
+        "code_url",
+        "first@example.com----https://mail.test/first\n"
+        "second@example.com----https://mail.test/second\n"
+        "third-no-credential@example.com----https://mail.test/third",
+    )
+    for email in ("first@example.com", "second@example.com"):
+        (credential_dir / f"codex-{email}.json").write_text(
+            json.dumps(
+                {
+                    "type": "plus",
+                    "email": email,
+                    "access_token": f"access-{email}",
+                    "refresh_token": f"refresh-{email}",
+                    "account_id": "chatgpt-account-1234567890",
+                    "id_token": _unsigned_jwt(
+                        {
+                            "https://api.openai.com/auth": {
+                                "chatgpt_account_id": "chatgpt-account-1234567890",
+                                "chatgpt_plan_type": "plus",
+                                "chatgpt_subscription_active_until": "2026-09-02T05:00:00+00:00",
+                            }
+                        }
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        "src.webapp.query_codex_quota",
+        lambda credential: {
+            "status": "ok",
+            "checked_at": "2026-08-02T00:00:00+00:00",
+            "plan_type": credential["type"],
+            "primary": {"remaining_percent": 80},
+            "secondary": {"remaining_percent": 60},
+        },
+    )
+    app = create_app(
+        _settings(workspace_path), mailbox_store=mailbox, codex_manager=FakeCodexManager()
+    )
+    client = app.test_client()
+
+    inventory = client.get("/api/seller/inventory").get_json()
+    credential_account = next(row for row in inventory["accounts"] if row["has_credential"])
+    assert credential_account["subscription_plan_type"] == "plus"
+    assert (
+        credential_account["subscription_active_until"]
+        == "2026-09-02T05:00:00+00:00"
+    )
+    assert credential_account["credential_account_hint"] == "chatgpt-…7890"
+    assert inventory["summary"] == {
+        "total": 3,
+        "credential_total": 2,
+        "unexported": 3,
+        "exported": 0,
+        "export_count": 0,
+        "quota_ok": 0,
+        "phone_verified": 0,
+        "phone_unverified": 3,
+    }
+    account_ids = [row["id"] for row in inventory["accounts"] if row["has_credential"]]
+    refreshed = client.post(
+        "/api/seller/quota/refresh", json={"account_ids": account_ids}
+    ).get_json()
+    assert refreshed["success"] == 2
+    refreshed_all = client.post(
+        "/api/seller/quota/refresh", json={"all": True}
+    ).get_json()
+    assert refreshed_all["total"] == 2
+    assert refreshed_all["success"] == 2
+    assert refreshed_all["failed"] == 0
+
+    no_credential = next(row for row in inventory["accounts"] if not row["has_credential"])
+    blocked_selected = client.post(
+        "/api/seller/export",
+        json={
+            "confirmed": True,
+            "account_ids": [no_credential["id"]],
+            "format": "sub2api",
+        },
+    )
+    assert blocked_selected.status_code == 409
+    selected_original = client.post(
+        "/api/seller/export",
+        json={
+            "confirmed": True,
+            "account_ids": [no_credential["id"]],
+            "format": "original",
+        },
+    )
+    assert selected_original.status_code == 200
+    assert selected_original.headers["X-Exported-Account-Count"] == "1"
+    assert selected_original.headers["X-Export-Mode"] == "selected"
+    with zipfile.ZipFile(io.BytesIO(selected_original.data)) as archive:
+        assert "third-no-credential@example.com" in archive.read("code_url.txt").decode("utf-8")
+
+    exported = client.post(
+        "/api/seller/export",
+        json={
+            "confirmed": True,
+            "count": 1,
+            "format": "sub2api",
+            "export_state": "unexported",
+            "phone_state": "all",
+        },
+    )
+    assert exported.status_code == 200
+    assert json.loads(exported.data)["accounts"][0]["platform"] == "openai"
+    after = client.get("/api/seller/inventory").get_json()
+    assert after["summary"]["exported"] == 2
+    assert after["summary"]["unexported"] == 1
+    assert after["summary"]["export_count"] == 2
+    exported_row = next(row for row in after["accounts"] if row["export_count"] == 1)
+    assert exported_row["last_exported_at"]
+
+    never_exported = client.post(
+        "/api/seller/export",
+        json={
+            "confirmed": True,
+            "all_unexported": True,
+            "format": "original",
+        },
+    )
+    assert never_exported.status_code == 200
+    assert never_exported.headers["X-Exported-Account-Count"] == "1"
+    assert never_exported.headers["X-Export-Mode"] == "all_unexported"
+    after_all = client.get("/api/seller/inventory").get_json()
+    assert after_all["summary"]["unexported"] == 0
+    assert after_all["summary"]["exported"] == 3
+    assert after_all["summary"]["export_count"] == 3
+    assert (
+        client.post(
+            "/api/seller/export",
+            json={"confirmed": True, "all_unexported": True, "format": "original"},
+        ).status_code
+        == 409
+    )
+
+    assert client.post("/api/seller/status", json={}).status_code == 404
     assert not (_settings(workspace_path).project_root / "templates" / "login.html").exists()
 
 
@@ -334,6 +560,10 @@ def test_pipeline_starts_selected_accounts_with_concurrency_and_retry_settings(w
     assert body["pipeline"]["total"] == 2
     assert body["pipeline"]["concurrency"] == 2
     assert codex.pipeline["emails"] == ["one@example.com", "two@example.com"]
+    resized = client.post("/api/codex-pipeline/pipeline-1/concurrency", json={"concurrency": 3})
+    assert resized.status_code == 200
+    assert resized.get_json()["pipeline"]["concurrency"] == 3
+    assert client.post("/api/codex-pipeline/pipeline-1/concurrency", json={"concurrency": 4}).status_code == 400
     paused = client.post("/api/codex-pipeline/pipeline-1/pause", json={})
     assert paused.status_code == 200
     assert paused.get_json()["pipeline"]["status"] == "paused"
@@ -396,6 +626,23 @@ def test_index_contains_sms_credential_visibility_toggle(workspace_path: Path):
     assert "凭证与统计" in html
     assert "运行日志" in html
     assert 'id="credentialSelectedCount"' in html
+    assert 'id="sellerRefreshAllQuota"' in html
+    assert 'id="sellerExportAllUnexported"' in html
+    assert 'id="sellerUnexportedCount"' in html
+    assert 'id="sellerExportedCount"' in html
+    assert 'id="sellerCredentialCount"' in html
+    assert 'id="sellerExportSelected"' in html
+    assert 'id="sellerExportCountTotal"' in html
+    assert "已导出 ${exportCount} 次" in html
+    assert "每次最多查询 20 个账号额度" not in html
+    assert 'class="seller-inventory-table"' in html
+    assert "function sellerSubscription" in html
+    assert "function sellerQuotaLabel" in html
+    assert "subscription_active_until" in html
+    assert "账号库存" in html
+    assert "卖家库存" not in html
+    assert "已售" not in html
+    assert "未售" not in html
     assert 'id="selectAllCredentials"' in html
     assert 'id="clearCredentialSelection"' in html
     assert 'id="downloadSelectedCredentials"' in html
@@ -404,6 +651,14 @@ def test_index_contains_sms_credential_visibility_toggle(workspace_path: Path):
     assert 'id="exportSelectedAccounts"' in html
     assert 'id="deleteSelectedAccounts"' in html
     assert 'id="deleteSelectedCredentials"' in html
+    assert 'id="selectFailedForPipeline"' in html
+    assert '<option value="otp_failed">取码失败</option>' in html
+    assert '<option value="expiring">凭证即将到期</option>' in html
+    assert "managedAccountIds=new Set()" in html
+    assert "data-account-manage" in html
+    assert "data-pipeline-toggle" in html
+    assert "function pipelineTiming" in html
+    assert "本批选择独立于管理勾选" in html
     assert "不执行注册" not in html
     assert html.index('id="importPanel"') < html.index('id="pipelineCard"')
     assert html.index('id="pipelineCard"') < html.index('id="accounts"')
@@ -465,6 +720,11 @@ def test_index_contains_sms_credential_visibility_toggle(workspace_path: Path):
     assert "<span>≡</span>" not in html
     assert b'id="pipelineScope"' in response.data
     assert b'id="pipelineConcurrency"' in response.data
+    assert b'id="pipelineConcurrencyHint"' in response.data
+    assert b'/concurrency`' in response.data
+    assert b"PIPELINE_SETTINGS_KEY='codex-pipeline-settings-v1'" in response.data
+    assert b"loadPipelineSettings();updateImportHelper()" in response.data
+    assert b"pipelineState.concurrency)||1)));$('#pipelineRetryLimit').value" not in response.data
     assert b'id="pipelineRetryLimit"' in response.data
     assert b'id="startPipeline"' in response.data
     assert b'id="pausePipeline"' in response.data
@@ -709,6 +969,15 @@ def test_selected_credential_archive_accepts_only_exportable_ids(workspace_path:
             "type": "codex",
             "email": "first@example.com",
             "access_token": "first-secret",
+            "id_token": _unsigned_jwt(
+                {
+                    "https://api.openai.com/auth": {
+                        "chatgpt_plan_type": "plus",
+                        "chatgpt_subscription_active_until": "2026-09-01T20:56:30+00:00",
+                    }
+                }
+            ),
+            "expired": "2026-08-11T21:06:39Z",
         },
         "codex-second@example.com.json": {
             "type": "codex",
@@ -816,6 +1085,11 @@ def test_selected_credential_archive_accepts_only_exportable_ids(workspace_path:
     assert payload["accounts"][0]["platform"] == "openai"
     assert payload["accounts"][0]["type"] == "oauth"
     assert payload["accounts"][0]["credentials"]["access_token"] == "first-secret"
+    assert payload["accounts"][0]["credentials"]["plan_type"] == "plus"
+    assert (
+        payload["accounts"][0]["credentials"]["expires_at"]
+        == "2026-09-01T20:56:30+00:00"
+    )
 
     removed = client.delete(
         "/api/artifacts/credentials/selected",
