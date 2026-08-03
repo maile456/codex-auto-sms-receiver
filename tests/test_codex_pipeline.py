@@ -273,10 +273,58 @@ def test_active_pipeline_can_scale_concurrency_for_queued_jobs(tmp_path: Path):
     _wait_for(lambda: len(started) == 2)
     assert manager.pipeline_overview(pipeline["id"])["counts"]["running"] == 2
     with pytest.raises(ValueError, match="并发"):
-        manager.set_pipeline_concurrency(pipeline["id"], 4)
+        manager.set_pipeline_concurrency(pipeline["id"], 11)
 
     release.set()
     _wait_for(lambda: not manager.pipeline_overview(pipeline["id"])["active"])
+
+
+def test_force_pause_fails_inflight_and_ignores_late_success(tmp_path: Path):
+    mailbox_store, emails = _mailboxes(tmp_path, count=2)
+    manager = CodexJobManager(_settings(tmp_path), mailbox_store)
+    manager.availability = lambda: {"available": True, "reason": ""}
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def handler(task):
+        if task["mailbox"]["email"] == emails[0]:
+            first_started.set()
+            release_first.wait(timeout=3)
+        return {
+            "dispatch_id": task["dispatch_id"],
+            "job_id": task["job_id"],
+            "attempt": task["attempt"],
+            "result": {"ok": True, "status": "success", "message": "late success"},
+        }
+
+    _install_fake_workers(manager, handler=handler, worker_count=1)
+    pipeline = manager.start_batch(emails, concurrency=1, retry_limit=2)
+    assert first_started.wait(timeout=3)
+
+    paused = manager.force_pause_pipeline(pipeline["id"])
+    assert paused is not None
+    assert paused["status"] == "paused"
+    assert paused["force_paused_count"] == 1
+    assert paused["counts"]["failed"] == 1
+    assert paused["counts"]["queued"] == 1
+    failed_job = next(row for row in manager.list_jobs() if row["email"] == emails[0])
+    assert failed_job["failure_code"] == "force_paused"
+    assert failed_job["retryable"] is False
+
+    release_first.set()
+    time.sleep(0.1)
+    failed_job = next(row for row in manager.list_jobs() if row["email"] == emails[0])
+    assert failed_job["status"] == "failed"
+    assert manager.resume_pipeline(pipeline["id"]) is True
+    finished = _wait_for(
+        lambda: (
+            value
+            if not (value := manager.pipeline_overview(pipeline["id"]))["active"]
+            else None
+        )
+    )
+    assert finished["counts"]["failed"] == 1
+    assert finished["counts"]["success"] == 1
 
 
 def test_pipeline_rejects_unsafe_limits_and_second_active_batch(tmp_path: Path):
@@ -285,7 +333,7 @@ def test_pipeline_rejects_unsafe_limits_and_second_active_batch(tmp_path: Path):
     manager.availability = lambda: {"available": True, "reason": ""}
 
     with pytest.raises(ValueError, match="并发"):
-        manager.start_batch(emails, concurrency=4)
+        manager.start_batch(emails, concurrency=11)
     with pytest.raises(ValueError, match="失败重试"):
         manager.start_batch(emails, retry_limit=4)
 
@@ -308,6 +356,93 @@ def test_pipeline_rejects_unsafe_limits_and_second_active_batch(tmp_path: Path):
     blocker.set()
 
 
+def test_pipeline_concurrency_limit_defaults_to_ten_and_is_configurable(
+    monkeypatch, tmp_path: Path
+):
+    mailbox_store, _ = _mailboxes(tmp_path, count=1)
+    monkeypatch.delenv("CODEX_PIPELINE_MAX_CONCURRENCY", raising=False)
+    manager = CodexJobManager(_settings(tmp_path), mailbox_store)
+
+    assert manager.runtime_config()["pipeline_max_concurrency"] == 10
+    monkeypatch.setenv("CODEX_PIPELINE_MAX_CONCURRENCY", "12")
+    assert manager.runtime_config()["pipeline_max_concurrency"] == 12
+    monkeypatch.setenv("CODEX_PIPELINE_MAX_CONCURRENCY", "99")
+    assert manager.runtime_config()["pipeline_max_concurrency"] == 20
+
+
+def test_success_callback_receives_email_and_credential_path_once(tmp_path: Path):
+    mailbox_store, emails = _mailboxes(tmp_path, count=1)
+    manager = CodexJobManager(_settings(tmp_path), mailbox_store)
+    manager.availability = lambda: {"available": True, "reason": ""}
+    credential_path = tmp_path / "credential.json"
+    callbacks = []
+    manager.set_success_callback(lambda email, path: callbacks.append((email, path)))
+
+    def handler(task):
+        credential_path.write_text("{}", encoding="utf-8")
+        return {
+            "dispatch_id": task["dispatch_id"],
+            "job_id": task["job_id"],
+            "attempt": task["attempt"],
+            "result": {
+                "ok": True,
+                "status": "success",
+                "message": "done",
+                "file_path": str(credential_path),
+            },
+        }
+
+    _install_fake_workers(manager, handler=handler, worker_count=1)
+    pipeline = manager.start_batch(emails, concurrency=1)
+    finished = _wait_for(
+        lambda: (
+            value
+            if not (value := manager.pipeline_overview(pipeline["id"]))["active"]
+            else None
+        )
+    )
+
+    assert finished["counts"]["success"] == 1
+    assert callbacks == [(emails[0], str(credential_path))]
+
+
+def test_success_callback_error_does_not_change_job_success(tmp_path: Path):
+    mailbox_store, emails = _mailboxes(tmp_path, count=1)
+    manager = CodexJobManager(_settings(tmp_path), mailbox_store)
+    manager.availability = lambda: {"available": True, "reason": ""}
+
+    def broken_callback(_email, _path):
+        raise RuntimeError("fixture callback failure")
+
+    manager.set_success_callback(broken_callback)
+
+    def handler(task):
+        return {
+            "dispatch_id": task["dispatch_id"],
+            "job_id": task["job_id"],
+            "attempt": task["attempt"],
+            "result": {
+                "ok": True,
+                "status": "success",
+                "message": "done",
+                "file_path": str(tmp_path / "credential.json"),
+            },
+        }
+
+    _install_fake_workers(manager, handler=handler, worker_count=1)
+    pipeline = manager.start_batch(emails, concurrency=1)
+    finished = _wait_for(
+        lambda: (
+            value
+            if not (value := manager.pipeline_overview(pipeline["id"]))["active"]
+            else None
+        )
+    )
+
+    assert finished["counts"]["success"] == 1
+    assert manager.list_jobs()[0]["status"] == "success"
+
+
 def test_generic_mailbox_timeouts_and_proxy_errors_are_retryable(tmp_path: Path):
     mailbox_store, _ = _mailboxes(tmp_path, count=1)
     manager = CodexJobManager(_settings(tmp_path), mailbox_store)
@@ -318,6 +453,44 @@ def test_generic_mailbox_timeouts_and_proxy_errors_are_retryable(tmp_path: Path)
     assert manager._failure_info(
         "GenericApiMailError: 网络请求失败（ProxyError）"
     ) == ("transient_network", True, 0)
+    assert manager._failure_info(
+        "任务执行超时：单次执行超过 600 秒，已终止本轮并释放执行槽位"
+    ) == ("task_timeout", True, 15)
+
+
+def test_pipeline_hard_timeout_finishes_stuck_attempt(tmp_path: Path):
+    mailbox_store, emails = _mailboxes(tmp_path, count=1)
+    manager = CodexJobManager(_settings(tmp_path), mailbox_store)
+    manager.availability = lambda: {"available": True, "reason": ""}
+    manager._attempt_timeout_seconds = lambda: 1
+    release = threading.Event()
+
+    def handler(task):
+        release.wait(timeout=3)
+        return {
+            "dispatch_id": task["dispatch_id"],
+            "job_id": task["job_id"],
+            "attempt": task["attempt"],
+            "result": {"ok": True, "status": "success", "message": "late result"},
+        }
+
+    _install_fake_workers(manager, handler=handler, worker_count=1)
+    pipeline = manager.start_batch(emails, retry_limit=0)
+    finished = _wait_for(
+        lambda: (
+            value
+            if not (value := manager.pipeline_overview(pipeline["id"]))["active"]
+            else None
+        ),
+        timeout=4,
+    )
+    release.set()
+
+    assert finished["counts"]["failed"] == 1
+    job = manager.list_jobs()[0]
+    assert job["failure_code"] == "task_timeout"
+    assert job["attempt_deadline_at"] is None
+    assert job["attempt_finished_at"]
 
 
 def test_isolated_worker_process_starts_and_stops_cleanly(tmp_path: Path):

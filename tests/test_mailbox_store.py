@@ -1,3 +1,4 @@
+import json
 import shutil
 import uuid
 from pathlib import Path
@@ -32,6 +33,33 @@ def test_import_outlook_masks_secrets(workspace_path: Path):
     assert "password" not in public
     secret = store.get_secret(email="owner@example.com")
     assert secret["refresh_token"] == "refresh-secret"
+
+
+def test_accounts_expose_import_time_and_sort_newest_import_first(workspace_path: Path):
+    store = MailboxStore(workspace_path)
+    store.import_text(
+        "code_url",
+        "older@example.com----https://mail.test/older\n"
+        "newer@example.com----https://mail.test/newer",
+    )
+    records = json.loads(store.path.read_text(encoding="utf-8"))
+    by_email = {row["email"]: row for row in records.values()}
+    by_email["older@example.com"].update(
+        imported_at="2026-08-03T08:00:00+00:00",
+        created_at="2026-08-03T08:00:00+00:00",
+        updated_at="2026-08-04T12:00:00+00:00",
+    )
+    by_email["newer@example.com"].update(
+        imported_at="2026-08-04T08:00:00+00:00",
+        created_at="2026-08-04T08:00:00+00:00",
+        updated_at="2026-08-03T12:00:00+00:00",
+    )
+    store.path.write_text(json.dumps(records), encoding="utf-8")
+
+    rows = store.list_accounts()
+
+    assert [row["email"] for row in rows] == ["newer@example.com", "older@example.com"]
+    assert rows[0]["imported_at"] == "2026-08-04T08:00:00+00:00"
 
 
 def test_import_generic_api_updates_existing(workspace_path: Path):

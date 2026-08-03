@@ -19,9 +19,29 @@ _MAX_METADATA_JSON_BYTES = 8 * 1024 * 1024
 _MAX_VIEW_LOG_BYTES = 32 * 1024 * 1024
 _MAX_LOG_PAGE_SIZE = 500
 _TIMELINE_TAIL_BYTES = 512 * 1024
-_TIMELINE_CACHE_FILES = 64
+_TIMELINE_CACHE_FILES = 24
 _TIMELINE_EVENTS_PER_FILE = 300
 _MAX_TIMELINE_PAGE_SIZE = 200
+_PLAN_ALIASES = {
+    "chatgptfreeplan": "free",
+    "freeplan": "free",
+    "chatgptplusplan": "plus",
+    "plusplan": "plus",
+    "chatgptproplan": "pro",
+    "proplan": "pro",
+    "chatgptteamplan": "team",
+    "teamplan": "team",
+    "chatgptbusinessplan": "business",
+    "businessplan": "business",
+    "chatgptenterpriseplan": "enterprise",
+    "enterpriseplan": "enterprise",
+}
+
+
+def _normalized_plan_type(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    compact = "".join(character for character in raw if character.isalnum())
+    return _PLAN_ALIASES.get(compact, raw)
 
 _ANSI_ESCAPE = re.compile(r"\x1b(?:[@-_][0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _LOG_RECORD = re.compile(
@@ -206,8 +226,14 @@ def _safe_oauth_metadata(payload: dict[str, Any]) -> dict[str, str]:
             auth = candidate
             break
 
-    plan_type = str(auth.get("chatgpt_plan_type") or payload.get("plan_type") or "").strip()
-    active_until = str(auth.get("chatgpt_subscription_active_until") or "").strip()
+    plan_type = _normalized_plan_type(
+        payload.get("plan_type") or auth.get("chatgpt_plan_type") or ""
+    )
+    active_until = str(
+        payload.get("subscription_active_until")
+        or auth.get("chatgpt_subscription_active_until")
+        or ""
+    ).strip()
     if active_until:
         try:
             parsed = datetime.fromisoformat(active_until.replace("Z", "+00:00"))
@@ -225,6 +251,9 @@ def _safe_oauth_metadata(payload: dict[str, Any]) -> dict[str, str]:
     return {
         "plan_type": plan_type[:40],
         "subscription_active_until": active_until[:80],
+        "subscription_checked_at": str(payload.get("subscription_checked_at") or "")[:80],
+        "subscription_source": str(payload.get("subscription_source") or "")[:40],
+        "subscription_error": str(payload.get("subscription_error") or "")[:160],
         "account_hint": account_hint[:40],
     }
 
@@ -763,6 +792,9 @@ class ArtifactStore:
                 "exportable": False,
                 "plan_type": "",
                 "subscription_active_until": "",
+                "subscription_checked_at": "",
+                "subscription_source": "",
+                "subscription_error": "",
                 "account_hint": "",
             }
         if not isinstance(payload, dict):

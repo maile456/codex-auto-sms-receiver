@@ -13,7 +13,7 @@ import uuid
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .artifact_store import _redact_log_text
 from .mailbox_store import MailboxStore
@@ -46,9 +46,10 @@ class CodexJobManager:
     _ACTIVE_JOBS = {"queued", "running", "retry_wait"}
     _TERMINAL_JOBS = {"success", "failed", "stopped", "deactivated", "skipped"}
     _ACTIVE_PIPELINES = {"queued", "running", "paused", "stopping"}
-    _MAX_CONCURRENCY = 3
+    _MAX_CONCURRENCY = 10
     _MAX_RETRY_LIMIT = 3
     _MAX_BATCH_SIZE = 200
+    _DEFAULT_ATTEMPT_TIMEOUT_SECONDS = 600
 
     def __init__(self, settings: Settings, mailbox_store: MailboxStore):
         self.settings = settings
@@ -64,9 +65,18 @@ class CodexJobManager:
         self._task_queue = None
         self._result_queue = None
         self._workers: list[Any] = []
+        self._active_dispatches: dict[str, dict[str, Any]] = {}
         self._pipeline_threads: dict[str, threading.Thread] = {}
+        self._success_callback: Callable[[str, str | None], None] | None = None
         self._load_state()
         self._recover_interrupted()
+
+    def set_success_callback(
+        self, callback: Callable[[str, str | None], None] | None
+    ) -> None:
+        """Register a non-blocking callback for newly saved OAuth credentials."""
+
+        self._success_callback = callback
 
     def availability(self) -> dict:
         if not (self.upstream_root / "core" / "codex_oauth.py").is_file():
@@ -96,9 +106,28 @@ class CodexJobManager:
             "auth_source": os.getenv("CODEX_AUTH_URL_SOURCE", "local") or "local",
             "sms_provider": "hero",
             "outlook_fetch_mode": os.getenv("OUTLOOK_FETCH_MODE", "direct") or "direct",
-            "pipeline_max_concurrency": self._MAX_CONCURRENCY,
+            "pipeline_max_concurrency": self._max_concurrency(),
             "pipeline_max_retries": self._MAX_RETRY_LIMIT,
+            "pipeline_attempt_timeout_seconds": self._attempt_timeout_seconds(),
         }
+
+    def _attempt_timeout_seconds(self) -> int:
+        """Return the hard deadline for one dispatched worker attempt."""
+
+        try:
+            value = int(os.getenv("CODEX_JOB_TIMEOUT_SECONDS", "") or self._DEFAULT_ATTEMPT_TIMEOUT_SECONDS)
+        except (TypeError, ValueError):
+            value = self._DEFAULT_ATTEMPT_TIMEOUT_SECONDS
+        return max(120, min(3600, value))
+
+    def _max_concurrency(self) -> int:
+        """Return the configured worker ceiling while keeping resource use bounded."""
+
+        try:
+            value = int(os.getenv("CODEX_PIPELINE_MAX_CONCURRENCY", "") or self._MAX_CONCURRENCY)
+        except (TypeError, ValueError):
+            value = self._MAX_CONCURRENCY
+        return max(1, min(20, value))
 
     @staticmethod
     def _otp_ready(mailbox: dict[str, Any]) -> bool:
@@ -336,8 +365,9 @@ class CodexJobManager:
             retry_backoff_seconds = int(retry_backoff_seconds)
         except (TypeError, ValueError) as exc:
             raise ValueError("流水线并发和重试参数必须是整数") from exc
-        if concurrency < 1 or concurrency > self._MAX_CONCURRENCY:
-            raise ValueError(f"任务并发必须在 1 - {self._MAX_CONCURRENCY} 之间")
+        max_concurrency = self._max_concurrency()
+        if concurrency < 1 or concurrency > max_concurrency:
+            raise ValueError(f"任务并发必须在 1 - {max_concurrency} 之间")
         if retry_limit < 0 or retry_limit > self._MAX_RETRY_LIMIT:
             raise ValueError(f"失败重试必须在 0 - {self._MAX_RETRY_LIMIT} 之间")
         if retry_backoff_seconds < 5 or retry_backoff_seconds > 600:
@@ -409,6 +439,7 @@ class CodexJobManager:
                 "concurrency": concurrency,
                 "retry_limit": retry_limit,
                 "retry_backoff_seconds": retry_backoff_seconds,
+                "attempt_timeout_seconds": self._attempt_timeout_seconds(),
                 "pause_requested": False,
                 "stop_requested": False,
                 "created_at": created_at,
@@ -449,13 +480,38 @@ class CodexJobManager:
                 worker.start()
                 self._workers.append(worker)
 
-    def _dispatch_locked(self, job: dict[str, Any], mailbox: dict[str, Any]) -> str:
+    def _terminate_worker(self, worker_pid: int | None) -> bool:
+        """Terminate one timed-out worker and remove it from the live pool."""
+
+        if not worker_pid:
+            return False
+        terminated = False
+        with self._lock:
+            for worker in list(self._workers):
+                if int(getattr(worker, "pid", 0) or 0) != int(worker_pid):
+                    continue
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(timeout=2)
+                terminated = True
+                break
+            self._workers = [worker for worker in self._workers if worker.is_alive()]
+        return terminated
+
+    def _dispatch_locked(
+        self,
+        job: dict[str, Any],
+        mailbox: dict[str, Any],
+        *,
+        timeout_seconds: int,
+    ) -> str:
         job["attempt"] = int(job.get("attempt") or 0) + 1
         attempt = int(job["attempt"])
         log_path = self._log_dir / (
             f"codex-{job.get('account_id')}-{job['id'][:8]}-a{attempt}.log"
         )
         dispatch_id = uuid.uuid4().hex
+        attempt_started_at = _now()
         job.update(
             status="running",
             stage="登录与授权",
@@ -463,6 +519,8 @@ class CodexJobManager:
             retryable=False,
             next_retry_at=None,
             started_at=job.get("started_at") or _now(),
+            attempt_started_at=attempt_started_at,
+            attempt_deadline_at=_after(timeout_seconds),
             finished_at=None,
             log_path=str(log_path),
         )
@@ -481,11 +539,18 @@ class CodexJobManager:
                 "log_path": str(log_path),
             }
         )
+        self._active_dispatches[dispatch_id] = {
+            "pipeline_id": str(job.get("pipeline_id") or ""),
+            "job_id": str(job.get("id") or ""),
+            "worker_pid": None,
+        }
         return dispatch_id
 
     @staticmethod
     def _failure_info(message: str, status: str = "", http_status: Any = None) -> tuple[str, bool, int]:
         text = f"{status} {message}".casefold()
+        if "任务执行超时" in text or "单次执行超过" in text:
+            return "task_timeout", True, 15
         if "等待通用 api 验证码超时" in text:
             return "mailbox_otp_timeout", True, 15
         if any(value in text for value in ("rate_limit", "too many", "请求过多")):
@@ -575,6 +640,8 @@ class CodexJobManager:
                 failure_code="",
                 retryable=False,
                 next_retry_at=None,
+                attempt_deadline_at=None,
+                attempt_finished_at=_now(),
                 finished_at=_now(),
             )
             self.mailbox_store.update_codex(
@@ -585,6 +652,15 @@ class CodexJobManager:
                 phone_verified=bool(phone_number),
                 phone_number=phone_number or None,
             )
+            if self._success_callback is not None:
+                try:
+                    self._success_callback(
+                        str(job.get("email") or ""), credential_path
+                    )
+                except Exception as exc:
+                    logging.getLogger(__name__).warning(
+                        "套餐刷新任务入队失败: %s", type(exc).__name__
+                    )
             return
 
         if status in {"deactivated", "skipped"}:
@@ -595,6 +671,8 @@ class CodexJobManager:
                 failure_code=status,
                 retryable=False,
                 next_retry_at=None,
+                attempt_deadline_at=None,
+                attempt_finished_at=_now(),
                 finished_at=_now(),
             )
             self.mailbox_store.update_codex(
@@ -620,6 +698,8 @@ class CodexJobManager:
                 failure_code=failure_code,
                 retryable=True,
                 next_retry_at=_after(delay),
+                attempt_deadline_at=None,
+                attempt_finished_at=_now(),
                 finished_at=None,
             )
             self.mailbox_store.update_codex(
@@ -636,6 +716,8 @@ class CodexJobManager:
             failure_code=failure_code,
             retryable=retryable,
             next_retry_at=None,
+            attempt_deadline_at=None,
+            attempt_finished_at=_now(),
             finished_at=_now(),
         )
         self.mailbox_store.update_codex(
@@ -643,7 +725,7 @@ class CodexJobManager:
         )
 
     def _run_pipeline(self, pipeline_id: str, mailboxes: dict[str, dict[str, Any]]) -> None:
-        inflight: dict[str, str] = {}
+        inflight: dict[str, dict[str, Any]] = {}
         with self._lock:
             pipeline = self._pipelines.get(pipeline_id)
             if pipeline is None:
@@ -655,12 +737,19 @@ class CodexJobManager:
             self._persist_locked()
 
         while True:
+            timed_out_worker_pids: list[int] = []
+            desired_workers = 1
+            pipeline_finished = False
             with self._lock:
                 pipeline = self._pipelines.get(pipeline_id)
                 if pipeline is None:
                     return
                 job_ids = [str(value) for value in pipeline.get("job_ids") or []]
                 changed = False
+                desired_workers = int(pipeline.get("concurrency") or 1)
+                timeout_seconds = int(
+                    pipeline.get("attempt_timeout_seconds") or self._attempt_timeout_seconds()
+                )
                 if pipeline.get("stop_requested"):
                     for job_id in job_ids:
                         job = self._jobs.get(job_id)
@@ -680,6 +769,36 @@ class CodexJobManager:
                             changed = True
 
                 now_ts = time.time()
+                for dispatch_id, active in list(inflight.items()):
+                    active_job = self._jobs.get(str(active.get("job_id") or ""))
+                    if active_job is not None and str(active_job.get("status") or "") == "running":
+                        continue
+                    inflight.pop(dispatch_id, None)
+                    self._active_dispatches.pop(dispatch_id, None)
+                    changed = True
+                for dispatch_id, active in list(inflight.items()):
+                    if now_ts - float(active.get("started_ts") or now_ts) < timeout_seconds:
+                        continue
+                    inflight.pop(dispatch_id, None)
+                    self._active_dispatches.pop(dispatch_id, None)
+                    job = self._jobs.get(str(active.get("job_id") or ""))
+                    worker_pid = int(active.get("worker_pid") or 0)
+                    if worker_pid:
+                        timed_out_worker_pids.append(worker_pid)
+                    if job is None or str(job.get("status") or "") != "running":
+                        continue
+                    self._handle_result_locked(
+                        job,
+                        {
+                            "error_type": "TaskTimeoutError",
+                            "error": (
+                                f"任务执行超时：单次执行超过 {timeout_seconds} 秒，"
+                                "已终止本轮并释放执行槽位"
+                            ),
+                        },
+                        pipeline,
+                    )
+                    changed = True
                 ready = [] if pipeline.get("pause_requested") else [
                     self._jobs[job_id]
                     for job_id in job_ids
@@ -695,8 +814,16 @@ class CodexJobManager:
                 for job in ready[:slots]:
                     if pipeline.get("stop_requested") or pipeline.get("pause_requested"):
                         break
-                    dispatch_id = self._dispatch_locked(job, mailboxes[job["id"]])
-                    inflight[dispatch_id] = job["id"]
+                    dispatch_id = self._dispatch_locked(
+                        job,
+                        mailboxes[job["id"]],
+                        timeout_seconds=timeout_seconds,
+                    )
+                    inflight[dispatch_id] = {
+                        "job_id": job["id"],
+                        "started_ts": time.time(),
+                        "worker_pid": None,
+                    }
                     changed = True
                 jobs = [self._jobs[job_id] for job_id in job_ids if job_id in self._jobs]
                 all_terminal = bool(jobs) and all(job.get("status") in self._TERMINAL_JOBS for job in jobs)
@@ -710,7 +837,14 @@ class CodexJobManager:
                     pipeline["status"] = "stopped" if pipeline.get("stop_requested") else "completed"
                     pipeline["finished_at"] = _now()
                     self._persist_locked()
-                    return
+                    pipeline_finished = True
+
+            if timed_out_worker_pids:
+                for worker_pid in set(timed_out_worker_pids):
+                    self._terminate_worker(worker_pid)
+                self._ensure_workers(desired_workers)
+            if pipeline_finished:
+                return
 
             try:
                 response = self._result_queue.get(timeout=0.5)
@@ -719,13 +853,22 @@ class CodexJobManager:
             if not isinstance(response, dict):
                 continue
             dispatch_id = str(response.get("dispatch_id") or "")
-            job_id = inflight.pop(dispatch_id, None)
-            if job_id is None:
+            active = inflight.get(dispatch_id)
+            if active is None:
                 continue
+            if str(response.get("kind") or "") == "started":
+                active["worker_pid"] = int(response.get("worker_pid") or 0) or None
+                tracked = self._active_dispatches.get(dispatch_id)
+                if tracked is not None:
+                    tracked["worker_pid"] = active["worker_pid"]
+                continue
+            inflight.pop(dispatch_id, None)
+            self._active_dispatches.pop(dispatch_id, None)
+            job_id = str(active.get("job_id") or "")
             with self._lock:
                 pipeline = self._pipelines.get(pipeline_id)
                 job = self._jobs.get(job_id)
-                if pipeline is None or job is None:
+                if pipeline is None or job is None or str(job.get("status") or "") != "running":
                     continue
                 self._handle_result_locked(job, response, pipeline)
                 self._persist_locked()
@@ -745,6 +888,72 @@ class CodexJobManager:
             self._persist_locked()
             return True
 
+    def force_pause_pipeline(self, pipeline_id: str) -> dict[str, Any] | None:
+        """Pause dispatch and fail every attempt that is running right now."""
+
+        worker_pids: list[int] = []
+        desired_workers = 1
+        with self._lock:
+            pipeline = self._pipelines.get(str(pipeline_id or ""))
+            if not pipeline or str(pipeline.get("status") or "") not in {"queued", "running", "paused"}:
+                return None
+            desired_workers = int(pipeline.get("concurrency") or 1)
+            now = _now()
+            running_job_ids = {
+                str(job_id)
+                for job_id in pipeline.get("job_ids") or []
+                if (self._jobs.get(str(job_id)) or {}).get("status") == "running"
+            }
+            pipeline.update(
+                pause_requested=True,
+                status="paused",
+                paused_at=now,
+                force_paused_at=now,
+                force_paused_count=len(running_job_ids),
+            )
+            for job_id in running_job_ids:
+                job = self._jobs.get(job_id)
+                if job is None:
+                    continue
+                job.update(
+                    status="failed",
+                    stage="强制暂停",
+                    message="流水线已强制暂停，本轮运行被终止并判定失败",
+                    failure_code="force_paused",
+                    retryable=False,
+                    next_retry_at=None,
+                    attempt_deadline_at=None,
+                    attempt_finished_at=now,
+                    finished_at=now,
+                )
+                self.mailbox_store.update_codex(
+                    str(job.get("email") or ""),
+                    status="failed",
+                    message="流水线强制暂停，运行中的账号已判定失败",
+                )
+            for dispatch_id, active in list(self._active_dispatches.items()):
+                if str(active.get("job_id") or "") not in running_job_ids:
+                    continue
+                worker_pid = int(active.get("worker_pid") or 0)
+                if worker_pid:
+                    worker_pids.append(worker_pid)
+                self._active_dispatches.pop(dispatch_id, None)
+            # A worker may not have acknowledged its dispatch yet. Since only one
+            # pipeline can be active, recycling the complete pool guarantees the
+            # force-pause has no orphaned network attempt.
+            if running_job_ids:
+                worker_pids.extend(
+                    int(getattr(worker, "pid", 0) or 0) for worker in self._workers
+                )
+            self._persist_locked()
+            public = self._pipeline_public_locked(pipeline)
+
+        for worker_pid in set(worker_pids):
+            self._terminate_worker(worker_pid)
+        if running_job_ids:
+            self._ensure_workers(desired_workers)
+        return public
+
     def set_pipeline_concurrency(self, pipeline_id: str, concurrency: int) -> dict[str, Any] | None:
         """Resize an active pipeline; already-running jobs are left untouched."""
 
@@ -752,8 +961,9 @@ class CodexJobManager:
             concurrency = int(concurrency)
         except (TypeError, ValueError) as exc:
             raise ValueError("任务并发必须是整数") from exc
-        if concurrency < 1 or concurrency > self._MAX_CONCURRENCY:
-            raise ValueError(f"任务并发必须在 1 - {self._MAX_CONCURRENCY} 之间")
+        max_concurrency = self._max_concurrency()
+        if concurrency < 1 or concurrency > max_concurrency:
+            raise ValueError(f"任务并发必须在 1 - {max_concurrency} 之间")
 
         with self._lock:
             pipeline = self._pipelines.get(str(pipeline_id or ""))

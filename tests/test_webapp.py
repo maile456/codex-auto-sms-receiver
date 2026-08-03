@@ -88,12 +88,27 @@ class FakeCodexManager:
         self.pipeline.update(status="paused", active=True)
         return True
 
+    def force_pause_pipeline(self, pipeline_id):
+        if pipeline_id != self.pipeline.get("id") or not self.pipeline.get("active"):
+            return None
+        running = int((self.pipeline.get("counts") or {}).get("running") or 0)
+        counts = dict(self.pipeline.get("counts") or {})
+        counts["running"] = 0
+        counts["failed"] = int(counts.get("failed") or 0) + running
+        self.pipeline.update(
+            status="paused",
+            active=True,
+            counts=counts,
+            force_paused_count=running,
+        )
+        return dict(self.pipeline)
+
     def set_pipeline_concurrency(self, pipeline_id, concurrency):
         if pipeline_id != self.pipeline.get("id") or not self.pipeline.get("active"):
             return None
         concurrency = int(concurrency)
-        if concurrency < 1 or concurrency > 3:
-            raise ValueError("任务并发必须在 1 - 3 之间")
+        if concurrency < 1 or concurrency > 10:
+            raise ValueError("任务并发必须在 1 - 10 之间")
         self.pipeline["concurrency"] = concurrency
         return dict(self.pipeline)
 
@@ -177,6 +192,25 @@ def test_original_account_material_requires_explicit_reveal(workspace_path: Path
     html = client.get("/").get_data(as_text=True)
     assert 'id="materialDialog"' in html
     assert 'data-account-material="${esc(id)}"' in html
+    assert "原始素材可能包含邮箱密码" not in html
+
+
+def test_code_url_can_be_opened_directly_from_local_inventory(workspace_path: Path):
+    client, mailbox, _ = _client(workspace_path)
+    target = "https://mail.test/code?id=fixture"
+    mailbox.import_text("code_url", f"owner@example.com----{target}")
+    account = mailbox.list_accounts()[0]
+
+    response = client.get(f"/api/accounts/{account['id']}/code-url/open")
+
+    assert response.status_code == 302
+    assert response.headers["Location"] == target
+    html = client.get("/").get_data(as_text=True)
+    assert 'data-account-url="${esc(id)}"' in html
+    assert "function accountMaterialUrl" in html
+    assert 'data-copy-email="${esc(row.email)}"' in html
+    assert 'data-copy-email="${esc(account.email)}"' in html
+    assert "toast('邮箱已复制')" in html
 
 
 def test_phone_status_is_exposed_and_unverified_accounts_export_original_format(
@@ -252,16 +286,34 @@ def test_seller_inventory_export_status_and_quota(monkeypatch, workspace_path: P
             ),
             encoding="utf-8",
         )
-    monkeypatch.setattr(
-        "src.webapp.query_codex_quota",
-        lambda credential: {
-            "status": "ok",
-            "checked_at": "2026-08-02T00:00:00+00:00",
-            "plan_type": credential["type"],
-            "primary": {"remaining_percent": 80},
-            "secondary": {"remaining_percent": 60},
-        },
-    )
+    def fake_refresh_metadata(path, *, include_quota):
+        credential = json.loads(Path(path).read_text(encoding="utf-8"))
+        return {
+            "credential": credential,
+            "subscription": {
+                "status": "ok",
+                "checked_at": "2026-08-02T00:00:00+00:00",
+                "plan_type": "plus",
+                "subscription_active_until": "2026-09-02T05:00:00+00:00",
+                "source": "accounts_check",
+            },
+            "subscription_error": None,
+            "quota": (
+                {
+                    "status": "ok",
+                    "checked_at": "2026-08-02T00:00:00+00:00",
+                    "plan_type": "plus",
+                    "primary": {"remaining_percent": 80},
+                    "secondary": {"remaining_percent": 60},
+                }
+                if include_quota
+                else None
+            ),
+            "quota_error": None,
+            "token_refreshed": False,
+        }
+
+    monkeypatch.setattr("src.webapp.refresh_codex_credential_metadata", fake_refresh_metadata)
     app = create_app(
         _settings(workspace_path), mailbox_store=mailbox, codex_manager=FakeCodexManager()
     )
@@ -296,6 +348,12 @@ def test_seller_inventory_export_status_and_quota(monkeypatch, workspace_path: P
     assert refreshed_all["total"] == 2
     assert refreshed_all["success"] == 2
     assert refreshed_all["failed"] == 0
+    refreshed_subscriptions = client.post(
+        "/api/seller/subscription/refresh", json={"account_ids": account_ids}
+    ).get_json()
+    assert refreshed_subscriptions["total"] == 2
+    assert refreshed_subscriptions["success"] == 2
+    assert refreshed_subscriptions["failed"] == 0
 
     no_credential = next(row for row in inventory["accounts"] if not row["has_credential"])
     blocked_selected = client.post(
@@ -363,8 +421,174 @@ def test_seller_inventory_export_status_and_quota(monkeypatch, workspace_path: P
         == 409
     )
 
+    multi = client.post(
+        "/api/seller/export",
+        json={
+            "confirmed": True,
+            "account_ids": account_ids,
+            "formats": ["codex_json", "sub2api"],
+        },
+    )
+    assert multi.status_code == 200
+    history_id = multi.headers["X-Export-History-ID"]
+    with zipfile.ZipFile(io.BytesIO(multi.data)) as archive:
+        assert set(archive.namelist()) == {"codex-json.zip", "sub2api.json"}
+        assert json.loads(archive.read("sub2api.json"))["accounts"][0]["platform"] == "openai"
+    history = client.get("/api/exports").get_json()["exports"]
+    assert history[0]["id"] == history_id
+    assert history[0]["formats"] == ["codex_json", "sub2api"]
+    assert history[0]["account_count"] == 2
+    downloaded = client.get(f"/api/exports/{history_id}/download")
+    assert downloaded.status_code == 200
+    assert downloaded.data == multi.data
+
     assert client.post("/api/seller/status", json={}).status_code == 404
     assert not (_settings(workspace_path).project_root / "templates" / "login.html").exists()
+
+
+def test_seller_export_filters_by_phone_verification_time(workspace_path: Path):
+    client, mailbox, _ = _client(workspace_path)
+    mailbox.import_text(
+        "code_url",
+        "early@example.com----https://mail.test/early\n"
+        "late@example.com----https://mail.test/late\n"
+        "unverified@example.com----https://mail.test/unverified",
+    )
+    records = json.loads(mailbox.path.read_text(encoding="utf-8"))
+    by_email = {row["email"]: row for row in records.values()}
+    by_email["early@example.com"].update(
+        phone_verified=True,
+        phone_verified_at="2026-08-01T02:00:00+00:00",
+        phone_number="+10000000001",
+    )
+    by_email["late@example.com"].update(
+        phone_verified=True,
+        phone_verified_at="2026-08-03T02:00:00+00:00",
+        phone_number="+10000000002",
+    )
+    mailbox.path.write_text(json.dumps(records), encoding="utf-8")
+
+    inventory = client.get("/api/seller/inventory").get_json()["accounts"]
+    assert [row["email"] for row in inventory] == [
+        "early@example.com",
+        "late@example.com",
+        "unverified@example.com",
+    ]
+
+    late = client.post(
+        "/api/seller/export",
+        json={
+            "confirmed": True,
+            "count": 1,
+            "format": "original",
+            "export_state": "all",
+            "phone_state": "verified",
+            "phone_verified_from": "2026-08-03T01:59:00Z",
+            "phone_verified_to": "2026-08-03T02:01:00Z",
+        },
+    )
+    assert late.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(late.data)) as archive:
+        material = archive.read("code_url.txt").decode("utf-8")
+        assert "late@example.com" in material
+        assert "early@example.com" not in material
+
+    early = client.post(
+        "/api/seller/export",
+        json={
+            "confirmed": True,
+            "all_unexported": True,
+            "format": "original",
+            "phone_state": "verified",
+            "phone_verified_from": "2026-08-01T00:00:00Z",
+            "phone_verified_to": "2026-08-02T00:00:00Z",
+        },
+    )
+    assert early.status_code == 200
+    assert early.headers["X-Exported-Account-Count"] == "1"
+    with zipfile.ZipFile(io.BytesIO(early.data)) as archive:
+        material = archive.read("code_url.txt").decode("utf-8")
+        assert "early@example.com" in material
+        assert "unverified@example.com" not in material
+
+    invalid = client.post(
+        "/api/seller/export",
+        json={
+            "confirmed": True,
+            "count": 1,
+            "format": "original",
+            "phone_verified_from": "2026-08-04T00:00:00Z",
+            "phone_verified_to": "2026-08-03T00:00:00Z",
+        },
+    )
+    assert invalid.status_code == 400
+    assert "开始时间" in invalid.get_json()["error"]
+
+
+def test_seller_export_filters_by_subscription_plan(workspace_path: Path):
+    client, mailbox, _ = _client(workspace_path)
+    mailbox.import_text(
+        "code_url",
+        "plus@example.com----https://mail.test/plus\n"
+        "free@example.com----https://mail.test/free",
+    )
+    credential_dir = workspace_path / "data" / "codex_accounts"
+    credential_dir.mkdir(parents=True, exist_ok=True)
+    for email, plan in (
+        ("plus@example.com", "chatgptplusplan"),
+        ("free@example.com", "chatgptfreeplan"),
+    ):
+        (credential_dir / f"codex-{email}.json").write_text(
+            json.dumps(
+                {
+                    "type": "codex",
+                    "email": email,
+                    "access_token": f"fixture-{plan}-access",
+                    "refresh_token": f"fixture-{plan}-refresh",
+                    "plan_type": plan,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    plus = client.post(
+        "/api/seller/export",
+        json={
+            "confirmed": True,
+            "count": 1,
+            "format": "original",
+            "export_state": "all",
+            "plan_state": "plus",
+        },
+    )
+    assert plus.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(plus.data)) as archive:
+        material = archive.read("code_url.txt").decode("utf-8")
+        assert "plus@example.com" in material
+        assert "free@example.com" not in material
+
+    free = client.post(
+        "/api/seller/export",
+        json={
+            "confirmed": True,
+            "count": 1,
+            "format": "original",
+            "export_state": "all",
+            "plan_state": "free",
+        },
+    )
+    assert free.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(free.data)) as archive:
+        material = archive.read("code_url.txt").decode("utf-8")
+        assert "free@example.com" in material
+        assert "plus@example.com" not in material
+
+    invalid = client.post(
+        "/api/seller/export",
+        json={"confirmed": True, "count": 1, "plan_state": "premium"},
+    )
+    assert invalid.status_code == 400
+    assert "套餐筛选" in invalid.get_json()["error"]
 
 
 def test_timeline_maps_account_email_and_accounts_include_safe_recent_task(
@@ -560,10 +784,10 @@ def test_pipeline_starts_selected_accounts_with_concurrency_and_retry_settings(w
     assert body["pipeline"]["total"] == 2
     assert body["pipeline"]["concurrency"] == 2
     assert codex.pipeline["emails"] == ["one@example.com", "two@example.com"]
-    resized = client.post("/api/codex-pipeline/pipeline-1/concurrency", json={"concurrency": 3})
+    resized = client.post("/api/codex-pipeline/pipeline-1/concurrency", json={"concurrency": 6})
     assert resized.status_code == 200
-    assert resized.get_json()["pipeline"]["concurrency"] == 3
-    assert client.post("/api/codex-pipeline/pipeline-1/concurrency", json={"concurrency": 4}).status_code == 400
+    assert resized.get_json()["pipeline"]["concurrency"] == 6
+    assert client.post("/api/codex-pipeline/pipeline-1/concurrency", json={"concurrency": 11}).status_code == 400
     paused = client.post("/api/codex-pipeline/pipeline-1/pause", json={})
     assert paused.status_code == 200
     assert paused.get_json()["pipeline"]["status"] == "paused"
@@ -586,6 +810,25 @@ def test_active_pipeline_account_cannot_be_deleted(workspace_path: Path):
 
     assert response.status_code == 409
     assert mailbox.get_secret(account_id=account["id"]) is not None
+
+
+def test_force_pause_endpoint_marks_running_count_failed(workspace_path: Path):
+    client, _, codex = _client(workspace_path)
+    codex.pipeline.update(
+        id="pipeline-1",
+        status="running",
+        active=True,
+        total=2,
+        counts={"running": 1, "queued": 1},
+    )
+
+    response = client.post("/api/codex-pipeline/pipeline-1/force-pause", json={})
+
+    assert response.status_code == 200
+    pipeline = response.get_json()["pipeline"]
+    assert pipeline["status"] == "paused"
+    assert pipeline["force_paused_count"] == 1
+    assert pipeline["counts"] == {"running": 0, "queued": 1, "failed": 1}
 
 
 def test_health_is_public(workspace_path: Path):
@@ -627,6 +870,11 @@ def test_index_contains_sms_credential_visibility_toggle(workspace_path: Path):
     assert "运行日志" in html
     assert 'id="credentialSelectedCount"' in html
     assert 'id="sellerRefreshAllQuota"' in html
+    assert 'id="sellerRefreshSubscription"' in html
+    assert 'id="sellerRefreshAllSubscriptions"' in html
+    assert "/api/seller/subscription/refresh" in html
+    assert "刷新所选套餐和额度" in html
+    assert "刷新全部套餐和额度" in html
     assert 'id="sellerExportAllUnexported"' in html
     assert 'id="sellerUnexportedCount"' in html
     assert 'id="sellerExportedCount"' in html
@@ -636,7 +884,17 @@ def test_index_contains_sms_credential_visibility_toggle(workspace_path: Path):
     assert "已导出 ${exportCount} 次" in html
     assert "每次最多查询 20 个账号额度" not in html
     assert 'class="seller-inventory-table"' in html
+    assert "function accountImportTimestamp" in html
+    assert "accountImportTimestamp(right)-accountImportTimestamp(left)" in html
+    assert '<th>导入时间</th><th>最近任务</th>' in html
+    assert 'data-label="导入时间"' in html
     assert "function sellerSubscription" in html
+    assert "function sellerDisplayPlan" in html
+    assert "credential_expired||''" not in html
+    assert "已保留原套餐" in html
+    assert "待确认" not in html
+    assert "刷新失败" not in html
+    assert html.count('class="workspace-icon"') == 5
     assert "function sellerQuotaLabel" in html
     assert "subscription_active_until" in html
     assert "账号库存" in html
@@ -647,7 +905,60 @@ def test_index_contains_sms_credential_visibility_toggle(workspace_path: Path):
     assert 'id="clearCredentialSelection"' in html
     assert 'id="downloadSelectedCredentials"' in html
     assert "/api/artifacts/credentials/selected/export" in html
-    assert '<option value="sub2api">Sub2API 导入 JSON</option>' in html
+    assert 'data-credential-export-format value="sub2api"' in html
+    assert 'data-seller-export-format value="sub2api"' in html
+    assert 'id="selectFilteredAccounts"' in html
+    assert 'id="selectAllManageAccounts"' in html
+    assert 'id="accountPhoneVerifiedFrom"' in html
+    assert 'id="accountPhoneVerifiedTo"' in html
+    assert 'id="clearAccountTimeFilter"' in html
+    assert "function accountMatchesPhoneTime" in html
+    assert 'id="sellerPhoneVerifiedFrom"' in html
+    assert 'id="sellerPhoneVerifiedTo"' in html
+    assert 'id="clearSellerPhoneTime"' in html
+    assert "function sellerMatchesPhoneTime" in html
+    assert 'data-seller-time-preset="today"' in html
+    assert 'data-seller-time-preset="7d"' in html
+    assert 'data-seller-time-preset="custom">自定义' in html
+    assert '<option value="verified" selected>已经接码</option>' in html
+    assert "setSellerTimePreset('all');switchWorkspace('accounts')" in html
+    assert 'class="active" data-seller-time-preset="all"' in html
+    assert "sellerTimePreset='all'" in html
+    assert "if(preset==='custom'){start=new Date(today);end=new Date(now)}" in html
+    assert '<strong id="sellerDateRangeLabel">全部接码时间</strong>' in html
+    assert "结束时间，默认当前时间" in html
+    assert 'data-seller-time-preset="30m"' in html
+    assert 'data-seller-time-preset="1h"' in html
+    assert 'data-seller-time-preset="6h"' in html
+    assert 'data-seller-time-preset="24h"' in html
+    assert 'id="sellerPhoneVerifiedFrom" type="datetime-local" step="60"' in html
+    assert 'id="sellerPhoneVerifiedTo" type="datetime-local" step="60"' in html
+    assert "function sellerLocalMinuteValue" in html
+    assert 'id="sellerPlanFilter"' in html
+    assert '<option value="plus">Plus</option>' in html
+    assert "function sellerPlanType" in html
+    assert "function normalizeSellerPlan" in html
+    assert "chatgptplusplan:'plus'" in html
+    assert "plan_state:planState" in html
+    assert "seller-phone-time-cell" in html
+    assert "phoneHeader.textContent='接码时间'" in html
+    assert 'id="sellerRangeSelect"' in html
+    assert 'id="sellerRangeHint"' in html
+    assert "function applySellerVisibleRange" in html
+    assert "event.shiftKey" in html
+    assert 'id="sellerOpenDateRange"' in html
+    assert 'id="sellerDateRangeDialog"' in html
+    assert 'id="sellerCalendarDays"' in html
+    assert "function renderSellerCalendar" in html
+    assert "showModal()" in html
+    assert 'data-seller-quick-select="10"' in html
+    assert 'data-seller-quick-select="20"' in html
+    assert 'data-seller-quick-select="50"' in html
+    assert "function quickSelectSellerAccounts" in html
+    assert 'id="sellerSelectFiltered"' in html
+    assert 'id="sellerSelectAll"' in html
+    assert 'id="exportHistory"' in html
+    assert 'id="forcePausePipeline"' in html
     assert 'id="exportSelectedAccounts"' in html
     assert 'id="deleteSelectedAccounts"' in html
     assert 'id="deleteSelectedCredentials"' in html
@@ -658,7 +969,17 @@ def test_index_contains_sms_credential_visibility_toggle(workspace_path: Path):
     assert "data-account-manage" in html
     assert "data-pipeline-toggle" in html
     assert "function pipelineTiming" in html
-    assert "本批选择独立于管理勾选" in html
+    assert "勾选起点后按住 Shift 勾选终点，可连续选择多个账号" in html
+    assert "function applyAccountVisibleRange" in html
+    assert "accountManageShiftPressed" in html
+    assert "event.shiftKey" in html
+    assert 'value="phone_unverified"' in html
+    assert 'value="filtered"' in html
+    assert 'value="batch"' in html
+    assert 'id="pipelineScopePreview"' in html
+    assert 'data-pipeline-scope="selected"' in html
+    assert 'id="sellerSort"' in html
+    assert "function sellerSortTime" in html
     assert "不执行注册" not in html
     assert html.index('id="importPanel"') < html.index('id="pipelineCard"')
     assert html.index('id="pipelineCard"') < html.index('id="accounts"')
@@ -721,6 +1042,12 @@ def test_index_contains_sms_credential_visibility_toggle(workspace_path: Path):
     assert b'id="pipelineScope"' in response.data
     assert b'id="pipelineConcurrency"' in response.data
     assert b'id="pipelineConcurrencyHint"' in response.data
+    assert b'id="pipelineAccountList"' in response.data
+    assert b'id="excludeRiskyAccounts"' in response.data
+    assert b'id="restoreExcludedAccounts"' in response.data
+    assert b'max="10" value="3"' in response.data
+    assert b"function accountRiskProfile" in response.data
+    assert b"pipelineExcludedAccountIds" in response.data
     assert b'/concurrency`' in response.data
     assert b"PIPELINE_SETTINGS_KEY='codex-pipeline-settings-v1'" in response.data
     assert b"loadPipelineSettings();updateImportHelper()" in response.data

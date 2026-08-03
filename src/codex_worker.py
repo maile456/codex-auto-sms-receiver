@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,6 +66,19 @@ def worker_main(settings, task_queue, result_queue) -> None:
         handler.addFilter(lambda record, name=worker_thread: record.threadName == name)
         root_logger.addHandler(handler)
         try:
+            # Report ownership before entering upstream network code.  The
+            # scheduler uses this PID to terminate only the worker whose
+            # current attempt exceeds the hard deadline, then provisions a
+            # replacement without disturbing other concurrent accounts.
+            result_queue.put(
+                {
+                    "kind": "started",
+                    "dispatch_id": dispatch_id,
+                    "job_id": job_id,
+                    "attempt": attempt,
+                    "worker_pid": os.getpid(),
+                }
+            )
             logging.getLogger(__name__).info(
                 "Pipeline worker start: source=%s attempt=%s",
                 mailbox.get("source"),

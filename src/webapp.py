@@ -4,17 +4,23 @@ import ipaddress
 import io
 import json
 import base64
-import tempfile
+import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, redirect, render_template, request, send_file, url_for
 
 from .artifact_store import ArtifactStore, _redact_log_text
-from .codex_quota import CodexQuotaStore, query_codex_quota
+from .codex_quota import (
+    CodexQuotaStore,
+    query_codex_quota,
+    refresh_codex_credential_metadata,
+)
+from .export_history import ExportHistoryStore
 from .hero_catalog import HeroCatalog
 from .hero_pricing import HeroPricingClient, HeroPricingError, filter_price_tiers
 from .mailbox_store import MailboxStore
@@ -92,6 +98,7 @@ def create_app(
     hero_catalog = hero_catalog or HeroCatalog()
     artifact_store = artifact_store or ArtifactStore(settings.data_dir, settings.log_dir)
     quota_store = quota_store or CodexQuotaStore(settings.data_dir)
+    export_history = ExportHistoryStore(settings.data_dir)
     if codex_manager is None:
         from .codex_service import CodexJobManager
 
@@ -126,6 +133,9 @@ def create_app(
             "next_retry_at",
             "created_at",
             "started_at",
+            "attempt_started_at",
+            "attempt_deadline_at",
+            "attempt_finished_at",
             "finished_at",
             "has_log",
             "log_count",
@@ -176,6 +186,11 @@ def create_app(
                 "subscription_active_until"
             )
             row["subscription_plan_type"] = (credential or {}).get("plan_type")
+            row["subscription_checked_at"] = (credential or {}).get(
+                "subscription_checked_at"
+            )
+            row["subscription_source"] = (credential or {}).get("subscription_source")
+            row["subscription_error"] = (credential or {}).get("subscription_error")
             row["credential_account_hint"] = (credential or {}).get("account_hint")
             if credential and not row.get("phone_number") and callable(phone_lookup):
                 verified = phone_lookup(str(row.get("id") or "")) or {}
@@ -274,6 +289,27 @@ def create_app(
         except (ValueError, KeyError) as exc:
             return _selection_error(exc)
         return jsonify({"ok": True, **material})
+
+    @app.get("/api/accounts/<account_id>/code-url/open")
+    def open_account_code_url(account_id: str):
+        if not _is_loopback_host(settings.host):
+            return jsonify({"ok": False, "error": "取码 URL 仅允许从本机 WebUI 打开"}), 403
+        account = mailbox_store.get_secret(account_id=account_id)
+        if account is None:
+            return jsonify({"ok": False, "error": "账号不存在"}), 404
+        target = str(account.get("code_url") or "").strip()
+        try:
+            parsed = urlsplit(target)
+            _ = parsed.port
+        except ValueError:
+            parsed = None
+        if (
+            parsed is None
+            or parsed.scheme.casefold() not in {"http", "https"}
+            or not parsed.hostname
+        ):
+            return jsonify({"ok": False, "error": "该账号没有可打开的取码 URL"}), 404
+        return redirect(target, code=302)
 
     @app.get("/api/sms-config")
     def get_sms_config():
@@ -611,9 +647,9 @@ def create_app(
         result["recent_task"] = _safe_recent_task(latest_job)
         return jsonify({"ok": True, **result})
 
-    def _zip_download(rows, *, filename: str):
+    def _zip_bytes(rows) -> bytes:
         if not rows:
-            return jsonify({"ok": False, "error": "没有可打包的文件"}), 404
+            raise ValueError("没有可打包的文件")
         total_size = 0
         for path, _ in rows:
             try:
@@ -621,32 +657,56 @@ def create_app(
             except OSError:
                 continue
         if total_size > 128 * 1024 * 1024:
-            return jsonify({"ok": False, "error": "归档文件总量超过 128MB，请单独下载"}), 413
-        # Keep small exports in memory, then transparently spill larger ZIPs
-        # to a temporary file instead of retaining up to 128 MB in RAM.
-        buffer = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
-        try:
-            with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                for path, relative in rows:
-                    try:
-                        archive.write(path, arcname=relative)
-                    except OSError:
-                        continue
-            buffer.seek(0)
-            response = send_file(
-                buffer,
-                mimetype="application/zip",
-                as_attachment=True,
-                download_name=filename,
-                conditional=False,
-                etag=False,
-                max_age=0,
-            )
-        except Exception:
-            buffer.close()
-            raise
-        response.call_on_close(buffer.close)
+            raise OverflowError("归档文件总量超过 128MB，请单独下载")
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path, relative in rows:
+                try:
+                    archive.write(path, arcname=relative)
+                except OSError:
+                    continue
+        return buffer.getvalue()
+
+    def _bytes_download(content: bytes, *, filename: str, mimetype: str):
+        return send_file(
+            io.BytesIO(content),
+            mimetype=mimetype,
+            as_attachment=True,
+            download_name=filename,
+            conditional=False,
+            etag=False,
+            max_age=0,
+        )
+
+    def _remembered_download(
+        content: bytes,
+        *,
+        filename: str,
+        mimetype: str,
+        kind: str,
+        formats: list[str],
+        account_count: int,
+    ):
+        history = export_history.save(
+            content,
+            filename=filename,
+            kind=kind,
+            formats=formats,
+            account_count=account_count,
+        )
+        response = _bytes_download(content, filename=filename, mimetype=mimetype)
+        response.headers["X-Export-History-ID"] = str(history["id"])
         return response
+
+    def _zip_download(rows, *, filename: str):
+        try:
+            return _bytes_download(
+                _zip_bytes(rows), filename=filename, mimetype="application/zip"
+            )
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+        except OverflowError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 413
 
     def _selected_credential_files(data, *, max_items: int = 100) -> list[tuple[Path, str]]:
         if not isinstance(data, dict):
@@ -764,9 +824,9 @@ def create_app(
             "accounts": accounts,
         }
 
-    def _original_accounts_download(account_ids: list[str], filename: str):
+    def _original_accounts_bytes(account_ids: list[str]) -> bytes:
         grouped = mailbox_store.export_original(account_ids)
-        buffer = tempfile.SpooledTemporaryFile(max_size=2 * 1024 * 1024, mode="w+b")
+        buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for source, lines in grouped.items():
                 archive.writestr(f"{source}.txt", ("\n".join(lines) + "\n").encode("utf-8"))
@@ -776,20 +836,99 @@ def create_app(
                     "utf-8"
                 ),
             )
-        buffer.seek(0)
-        response = send_file(
-            buffer,
+        return buffer.getvalue()
+
+    def _original_accounts_download(account_ids: list[str], filename: str):
+        return _bytes_download(
+            _original_accounts_bytes(account_ids),
+            filename=filename,
             mimetype="application/zip",
+        )
+
+    def _normalize_export_formats(data: dict, *, default: str) -> list[str]:
+        requested = data.get("formats")
+        if requested is None:
+            requested = [data.get("format") or default]
+        if not isinstance(requested, list) or not requested:
+            raise ValueError("请至少选择一种导出格式")
+        formats = list(dict.fromkeys(str(value or "").strip().lower() for value in requested))
+        if any(value not in {"original", "codex_json", "sub2api"} for value in formats):
+            raise ValueError("不支持的账号导出格式")
+        return formats
+
+    def _account_export_content(
+        account_ids: list[str], formats: list[str], *, scope: str
+    ) -> tuple[bytes, str, str]:
+        parts: dict[str, bytes] = {}
+        if "original" in formats:
+            parts["original-format.zip"] = _original_accounts_bytes(account_ids)
+        credential_formats = [value for value in formats if value != "original"]
+        if credential_formats:
+            rows = _selected_credential_files(
+                {"account_ids": account_ids, "credential_ids": [], "confirmed": True},
+                max_items=500,
+            )
+            if "codex_json" in credential_formats:
+                parts["codex-json.zip"] = _zip_bytes(rows)
+            if "sub2api" in credential_formats:
+                parts["sub2api.json"] = (
+                    json.dumps(_sub2api_payload(rows), ensure_ascii=False, indent=2).encode("utf-8")
+                    + b"\n"
+                )
+        if len(parts) == 1:
+            part_name, content = next(iter(parts.items()))
+            return content, f"account-inventory-{scope}-{part_name}", (
+                "application/json" if part_name.endswith(".json") else "application/zip"
+            )
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for part_name, content in parts.items():
+                archive.writestr(part_name, content)
+        return buffer.getvalue(), f"account-inventory-{scope}-multi-format.zip", "application/zip"
+
+    def _credential_export_content(
+        rows: list[tuple[Path, str]], formats: list[str], *, scope: str
+    ) -> tuple[bytes, str, str]:
+        parts: dict[str, bytes] = {}
+        if "codex_json" in formats:
+            parts["codex-json.zip"] = _zip_bytes(rows)
+        if "sub2api" in formats:
+            parts["sub2api.json"] = (
+                json.dumps(_sub2api_payload(rows), ensure_ascii=False, indent=2).encode("utf-8")
+                + b"\n"
+            )
+        if len(parts) == 1:
+            part_name, content = next(iter(parts.items()))
+            return content, f"{scope}-{part_name}", (
+                "application/json" if part_name.endswith(".json") else "application/zip"
+            )
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for part_name, content in parts.items():
+                archive.writestr(part_name, content)
+        return buffer.getvalue(), f"{scope}-multi-format.zip", "application/zip"
+
+    @app.get("/api/exports")
+    def list_export_history():
+        return jsonify({"ok": True, "exports": export_history.list()})
+
+    @app.get("/api/exports/<export_id>/download")
+    def download_export_history(export_id: str):
+        resolved = export_history.file(export_id)
+        if resolved is None:
+            return jsonify({"ok": False, "error": "导出记录不存在或文件已清理"}), 404
+        path, metadata = resolved
+        return send_file(
+            path,
+            mimetype="application/json" if str(metadata.get("filename") or "").endswith(".json") else "application/zip",
             as_attachment=True,
-            download_name=filename,
+            download_name=str(metadata.get("filename") or path.name),
             conditional=False,
             etag=False,
             max_age=0,
         )
-        response.call_on_close(buffer.close)
-        return response
 
-    def _credential_payload_for_account(account_id: str) -> dict:
+    def _credential_record_for_account(account_id: str) -> tuple[dict, Path, dict]:
         account = mailbox_store.get_secret(account_id=account_id)
         if account is None:
             raise KeyError("所选账号不存在")
@@ -808,13 +947,127 @@ def create_app(
             raise ValueError("OAuth 凭证文件读取失败") from exc
         if not isinstance(payload, dict):
             raise ValueError("OAuth 凭证格式无效")
-        return payload
+        return account, path, payload
+
+    def _credential_payload_for_account(account_id: str) -> dict:
+        return _credential_record_for_account(account_id)[2]
+
+    def _refresh_account_metadata(account_id: str, *, include_quota: bool) -> dict:
+        _, credential_path, _ = _credential_record_for_account(account_id)
+        refreshed = refresh_codex_credential_metadata(
+            credential_path, include_quota=include_quota
+        )
+        subscription = refreshed.get("subscription")
+        subscription_error = refreshed.get("subscription_error")
+        if isinstance(subscription, dict):
+            stored = quota_store.put_subscription(account_id, subscription)
+        else:
+            stored = quota_store.record_subscription_error(
+                account_id, subscription_error or "套餐查询失败"
+            )
+        quota = refreshed.get("quota")
+        quota_error = refreshed.get("quota_error")
+        if include_quota:
+            if isinstance(quota, dict):
+                stored = quota_store.put(account_id, quota)
+            else:
+                stored = quota_store.record_error(account_id, quota_error or "额度查询失败")
+        return {
+            **stored,
+            "token_refreshed": bool(refreshed.get("token_refreshed")),
+        }
+
+    metadata_executor = ThreadPoolExecutor(
+        max_workers=3, thread_name_prefix="codex-metadata"
+    )
+    metadata_schedule_lock = threading.Lock()
+    metadata_scheduled: set[str] = set()
+
+    def _schedule_account_metadata_refresh(
+        account_id: str, *, attempt: int = 0, delay: float = 0
+    ) -> None:
+        key = f"{account_id}:{attempt}"
+        with metadata_schedule_lock:
+            if key in metadata_scheduled:
+                return
+            metadata_scheduled.add(key)
+
+        def run() -> None:
+            try:
+                result = _refresh_account_metadata(account_id, include_quota=True)
+                plan_type = str(
+                    result.get("subscription_plan_type") or result.get("plan_type") or ""
+                ).strip().lower()
+                subscription_status = str(result.get("subscription_status") or "")
+                if attempt < 2 and (
+                    plan_type in {"", "free"} or subscription_status != "ok"
+                ):
+                    _schedule_account_metadata_refresh(
+                        account_id,
+                        attempt=attempt + 1,
+                        delay=(30, 120)[attempt],
+                    )
+            except Exception:
+                if attempt < 2:
+                    _schedule_account_metadata_refresh(
+                        account_id,
+                        attempt=attempt + 1,
+                        delay=(30, 120)[attempt],
+                    )
+            finally:
+                with metadata_schedule_lock:
+                    metadata_scheduled.discard(key)
+
+        def submit() -> None:
+            metadata_executor.submit(run)
+
+        if delay > 0:
+            timer = threading.Timer(delay, submit)
+            timer.daemon = True
+            timer.start()
+        else:
+            submit()
+
+    def _queue_success_metadata_refresh(email: str, _credential_path: str | None) -> None:
+        account = mailbox_store.get_secret(email=str(email or ""))
+        if account is not None:
+            _schedule_account_metadata_refresh(str(account.get("id") or ""))
+
+    success_callback_setter = getattr(codex_manager, "set_success_callback", None)
+    if callable(success_callback_setter):
+        success_callback_setter(_queue_success_metadata_refresh)
+
+    def _requested_inventory_account_ids(data: dict, noun: str) -> list[str]:
+        if data.get("all") is True:
+            account_ids = [
+                str(row.get("id") or "")
+                for row in _account_rows()
+                if row.get("has_credential")
+            ]
+        else:
+            account_ids = data.get("account_ids")
+        if not isinstance(account_ids, list) or not account_ids:
+            raise ValueError(f"请至少选择一个账号{noun}")
+        normalized = list(dict.fromkeys(str(value or "").strip() for value in account_ids))
+        if any(not value for value in normalized):
+            raise ValueError("账号 ID 格式无效")
+        return normalized
 
     @app.get("/api/seller/inventory")
     def seller_inventory():
         # Inventory is account-centric: imported accounts remain manageable
         # before phone verification or OAuth credential creation.
         accounts = _account_rows()
+        def phone_order(row: dict) -> tuple[float, str]:
+            try:
+                verified_at = datetime.fromisoformat(
+                    str(row.get("phone_verified_at") or "").replace("Z", "+00:00")
+                ).timestamp()
+            except (TypeError, ValueError):
+                verified_at = float("inf")
+            return verified_at, str(row.get("email") or "").casefold()
+
+        accounts.sort(key=phone_order)
         quotas = quota_store.list()
         for row in accounts:
             row["quota"] = quotas.get(str(row.get("id") or ""))
@@ -835,40 +1088,71 @@ def create_app(
         data = request.get_json(silent=True) or {}
         if not isinstance(data, dict):
             return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
-        if data.get("all") is True:
-            account_ids = [
-                str(row.get("id") or "")
-                for row in _account_rows()
-                if row.get("has_credential")
-            ]
-        else:
-            account_ids = data.get("account_ids")
-        if not isinstance(account_ids, list) or not account_ids:
-            return jsonify({"ok": False, "error": "请至少选择一个账号查询额度"}), 400
-        normalized = list(dict.fromkeys(str(value or "").strip() for value in account_ids))
-        if any(not value for value in normalized):
-            return jsonify({"ok": False, "error": "账号 ID 格式无效"}), 400
+        try:
+            normalized = _requested_inventory_account_ids(data, "刷新套餐和额度")
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
 
         def refresh_one(account_id: str) -> tuple[str, dict]:
             try:
-                result = query_codex_quota(_credential_payload_for_account(account_id))
-                return account_id, quota_store.put(account_id, result)
+                return account_id, _refresh_account_metadata(account_id, include_quota=True)
             except Exception as exc:
+                quota_store.record_subscription_error(account_id, exc)
                 return account_id, quota_store.record_error(account_id, exc)
 
         results = {}
-        with ThreadPoolExecutor(max_workers=min(8, len(normalized))) as executor:
+        with ThreadPoolExecutor(max_workers=min(5, len(normalized))) as executor:
             futures = [executor.submit(refresh_one, account_id) for account_id in normalized]
             for future in as_completed(futures):
                 account_id, result = future.result()
                 results[account_id] = result
+        success = sum(
+            item.get("status") == "ok"
+            and item.get("subscription_status") == "ok"
+            for item in results.values()
+        )
         return jsonify(
             {
                 "ok": True,
                 "total": len(results),
                 "results": results,
-                "success": sum(item.get("status") == "ok" for item in results.values()),
-                "failed": sum(item.get("status") != "ok" for item in results.values()),
+                "success": success,
+                "failed": len(results) - success,
+            }
+        )
+
+    @app.post("/api/seller/subscription/refresh")
+    def refresh_seller_subscription():
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
+        try:
+            normalized = _requested_inventory_account_ids(data, "刷新套餐")
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+        def refresh_one(account_id: str) -> tuple[str, dict]:
+            try:
+                return account_id, _refresh_account_metadata(account_id, include_quota=False)
+            except Exception as exc:
+                return account_id, quota_store.record_subscription_error(account_id, exc)
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=min(5, len(normalized))) as executor:
+            futures = [executor.submit(refresh_one, account_id) for account_id in normalized]
+            for future in as_completed(futures):
+                account_id, result = future.result()
+                results[account_id] = result
+        success = sum(
+            item.get("subscription_status") == "ok" for item in results.values()
+        )
+        return jsonify(
+            {
+                "ok": True,
+                "total": len(results),
+                "results": results,
+                "success": success,
+                "failed": len(results) - success,
             }
         )
 
@@ -879,9 +1163,64 @@ def create_app(
         data = request.get_json(silent=True) or {}
         if not isinstance(data, dict) or data.get("confirmed") is not True:
             return jsonify({"ok": False, "error": "导出前必须明确确认"}), 400
-        export_format = str(data.get("format") or "original").strip().lower()
-        if export_format not in {"original", "codex_json", "sub2api"}:
-            return jsonify({"ok": False, "error": "不支持的账号库存导出格式"}), 400
+        try:
+            export_formats = _normalize_export_formats(data, default="original")
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        needs_credential = any(value != "original" for value in export_formats)
+        phone_state = str(data.get("phone_state") or "all").strip().lower()
+        if phone_state not in {"all", "verified", "unverified"}:
+            return jsonify({"ok": False, "error": "接码状态筛选无效"}), 400
+        plan_state = str(data.get("plan_state") or "all").strip().lower()
+        if plan_state not in {"all", "plus", "free", "other", "unknown"}:
+            return jsonify({"ok": False, "error": "套餐筛选无效"}), 400
+
+        def parse_phone_time(key: str) -> datetime | None:
+            value = str(data.get(key) or "").strip()
+            if not value:
+                return None
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("接码时间筛选格式无效") from exc
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+        try:
+            phone_verified_from = parse_phone_time("phone_verified_from")
+            phone_verified_to = parse_phone_time("phone_verified_to")
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        if phone_verified_from and phone_verified_to and phone_verified_from > phone_verified_to:
+            return jsonify({"ok": False, "error": "接码开始时间不能晚于结束时间"}), 400
+
+        def matches_phone_filters(row: dict) -> bool:
+            if phone_state == "verified" and not row.get("phone_verified"):
+                return False
+            if phone_state == "unverified" and row.get("phone_verified"):
+                return False
+            plan_type = str(row.get("subscription_plan_type") or "").strip().lower()
+            if plan_state == "plus" and plan_type != "plus":
+                return False
+            if plan_state == "free" and plan_type != "free":
+                return False
+            if plan_state == "unknown" and plan_type:
+                return False
+            if plan_state == "other" and plan_type in {"", "plus", "free"}:
+                return False
+            if phone_verified_from is None and phone_verified_to is None:
+                return True
+            try:
+                verified_at = datetime.fromisoformat(
+                    str(row.get("phone_verified_at") or "").replace("Z", "+00:00")
+                )
+            except ValueError:
+                return False
+            if verified_at.tzinfo is None:
+                verified_at = verified_at.replace(tzinfo=timezone.utc)
+            return (
+                (phone_verified_from is None or verified_at >= phone_verified_from)
+                and (phone_verified_to is None or verified_at <= phone_verified_to)
+            )
 
         inventory = _account_rows()
         inventory.sort(
@@ -908,8 +1247,12 @@ def create_app(
             name_scope = "selected"
             export_mode = "selected"
         elif all_unexported:
-            selected = [row for row in inventory if int(row.get("export_count") or 0) == 0]
-            if export_format != "original":
+            selected = [
+                row
+                for row in inventory
+                if int(row.get("export_count") or 0) == 0 and matches_phone_filters(row)
+            ]
+            if needs_credential:
                 selected = [row for row in selected if row.get("has_credential")]
             if not selected:
                 return jsonify({"ok": False, "error": "当前没有符合该格式的未导出账号"}), 409
@@ -919,11 +1262,8 @@ def create_app(
             export_mode = "all_unexported"
         else:
             export_state = str(data.get("export_state") or "unexported").strip().lower()
-            phone_state = str(data.get("phone_state") or "all").strip().lower()
             if export_state not in {"all", "unexported", "exported"}:
                 return jsonify({"ok": False, "error": "导出状态筛选无效"}), 400
-            if phone_state not in {"all", "verified", "unverified"}:
-                return jsonify({"ok": False, "error": "接码状态筛选无效"}), 400
             candidates = [
                 row
                 for row in inventory
@@ -932,13 +1272,9 @@ def create_app(
                     or (export_state == "unexported" and int(row.get("export_count") or 0) == 0)
                     or (export_state == "exported" and int(row.get("export_count") or 0) > 0)
                 )
-                and (
-                    phone_state == "all"
-                    or (phone_state == "verified" and row.get("phone_verified"))
-                    or (phone_state == "unverified" and not row.get("phone_verified"))
-                )
+                and matches_phone_filters(row)
             ]
-            if export_format != "original":
+            if needs_credential:
                 candidates = [row for row in candidates if row.get("has_credential")]
             try:
                 count = int(data.get("count", 1))
@@ -954,7 +1290,7 @@ def create_app(
             name_scope = export_state
             export_mode = "count"
 
-        if export_format != "original":
+        if needs_credential:
             missing_credentials = [row for row in selected if not row.get("has_credential")]
             if missing_credentials:
                 return jsonify(
@@ -969,32 +1305,17 @@ def create_app(
 
         account_ids = [str(row.get("id") or "") for row in selected]
         try:
-            if export_format == "original":
-                response = _original_accounts_download(
-                    account_ids, f"account-inventory-{name_scope}-original-format.zip"
-                )
-            else:
-                rows = _selected_credential_files(
-                    {"account_ids": account_ids, "credential_ids": [], "confirmed": True},
-                    max_items=500 if all_unexported or requested_ids is not None else 100,
-                )
-                if export_format == "codex_json":
-                    response = _zip_download(
-                        rows, filename=f"account-inventory-{name_scope}-codex-json.zip"
-                    )
-                elif export_format == "sub2api":
-                    content = json.dumps(
-                        _sub2api_payload(rows), ensure_ascii=False, indent=2
-                    ).encode("utf-8") + b"\n"
-                    response = send_file(
-                        io.BytesIO(content),
-                        mimetype="application/json",
-                        as_attachment=True,
-                        download_name=f"account-inventory-{name_scope}-sub2api.json",
-                        conditional=False,
-                        etag=False,
-                        max_age=0,
-                    )
+            content, filename, mimetype = _account_export_content(
+                account_ids, export_formats, scope=name_scope
+            )
+            response = _remembered_download(
+                content,
+                filename=filename,
+                mimetype=mimetype,
+                kind="seller_inventory",
+                formats=export_formats,
+                account_count=len(account_ids),
+            )
             mailbox_store.record_exports(account_ids)
             response.headers["X-Exported-Account-Count"] = str(len(account_ids))
             response.headers["X-Export-Mode"] = export_mode
@@ -1031,24 +1352,22 @@ def create_app(
             rows = _selected_credential_files(data)
         except (ValueError, KeyError, OverflowError) as exc:
             return _selection_error(exc)
-        export_format = str((data or {}).get("format") or "codex_json").strip().lower()
-        if export_format == "codex_json":
-            return _zip_download(rows, filename="codex-selected-credentials.zip")
-        if export_format != "sub2api":
-            return jsonify({"ok": False, "error": "不支持的凭证导出格式"}), 400
         try:
-            payload = _sub2api_payload(rows)
+            formats = _normalize_export_formats(data or {}, default="codex_json")
+            if "original" in formats:
+                raise ValueError("凭证导出仅支持 Codex JSON 和 Sub2API")
+            content, filename, mimetype = _credential_export_content(
+                rows, formats, scope="selected-credentials"
+            )
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
-        content = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
-        return send_file(
-            io.BytesIO(content),
-            mimetype="application/json",
-            as_attachment=True,
-            download_name="sub2api-accounts.json",
-            conditional=False,
-            etag=False,
-            max_age=0,
+        return _remembered_download(
+            content,
+            filename=filename,
+            mimetype=mimetype,
+            kind="credentials",
+            formats=formats,
+            account_count=len(rows),
         )
 
     @app.delete("/api/artifacts/credentials/selected")
@@ -1135,7 +1454,15 @@ def create_app(
         if any(not isinstance(value, str) or not value.strip() for value in account_ids):
             return jsonify({"ok": False, "error": "账号 ID 格式无效"}), 400
         try:
-            return _original_accounts_download(account_ids, "account-materials-original-format.zip")
+            content = _original_accounts_bytes(account_ids)
+            return _remembered_download(
+                content,
+                filename="account-materials-original-format.zip",
+                mimetype="application/zip",
+                kind="account_materials",
+                formats=["original"],
+                account_count=len(account_ids),
+            )
         except (ValueError, KeyError) as exc:
             return _selection_error(exc)
 
@@ -1262,6 +1589,16 @@ def create_app(
         if not pauser(pipeline_id):
             return jsonify({"ok": False, "error": "流水线不存在、已暂停或已结束"}), 409
         return jsonify({"ok": True, "pipeline": _pipeline_overview()})
+
+    @app.post("/api/codex-pipeline/<pipeline_id>/force-pause")
+    def force_pause_codex_pipeline(pipeline_id: str):
+        pauser = getattr(codex_manager, "force_pause_pipeline", None)
+        if not callable(pauser):
+            return jsonify({"ok": False, "error": "当前任务管理器不支持强制暂停"}), 501
+        pipeline = pauser(pipeline_id)
+        if pipeline is None:
+            return jsonify({"ok": False, "error": "流水线不存在或已经结束"}), 409
+        return jsonify({"ok": True, "pipeline": pipeline})
 
     @app.post("/api/codex-pipeline/<pipeline_id>/concurrency")
     def set_codex_pipeline_concurrency(pipeline_id: str):

@@ -104,6 +104,7 @@ class MailboxStore:
             "email": record.get("email"),
             "source": record.get("source"),
             "otp_ready": otp_ready,
+            "imported_at": record.get("imported_at") or record.get("created_at"),
             "created_at": record.get("created_at"),
             "updated_at": record.get("updated_at"),
             "codex_status": record.get("codex_status") or "",
@@ -124,7 +125,15 @@ class MailboxStore:
         with self._lock:
             records = self._read()
             rows = [self._public(record) for record in records.values()]
-        rows.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        rows.sort(
+            key=lambda item: str(
+                item.get("imported_at")
+                or item.get("created_at")
+                or item.get("updated_at")
+                or ""
+            ),
+            reverse=True,
+        )
         return rows
 
     def get_secret(self, *, account_id: str | None = None, email: str | None = None) -> dict | None:
@@ -226,6 +235,7 @@ class MailboxStore:
                 record = existing or {
                     "id": account_id,
                     "email": email,
+                    "imported_at": now,
                     "created_at": now,
                     "codex_status": "",
                     "codex_message": "",
