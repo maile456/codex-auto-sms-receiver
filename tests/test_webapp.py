@@ -60,7 +60,15 @@ class FakeCodexManager:
     def pipeline_overview(self):
         return dict(self.pipeline)
 
-    def start_batch(self, emails, *, concurrency, retry_limit, retry_backoff_seconds):
+    def start_batch(
+        self,
+        emails,
+        *,
+        concurrency,
+        retry_limit,
+        retry_backoff_seconds,
+        reauth=False,
+    ):
         self.pipeline = {
             "id": "pipeline-1",
             "status": "running",
@@ -73,6 +81,7 @@ class FakeCodexManager:
             "progress": 0.0,
             "counts": {"queued": len(emails)},
             "emails": list(emails),
+            "mode": "credential_reauth" if reauth else "login_and_verify",
         }
         return dict(self.pipeline)
 
@@ -193,6 +202,46 @@ def test_original_account_material_requires_explicit_reveal(workspace_path: Path
     assert 'id="materialDialog"' in html
     assert 'data-account-material="${esc(id)}"' in html
     assert "原始素材可能包含邮箱密码" not in html
+
+
+def test_account_formats_can_be_previewed_beside_inventory_row(workspace_path: Path):
+    client, mailbox, _ = _client(workspace_path)
+    material = "owner@example.com----https://mail.test/code?id=fixture"
+    mailbox.import_text("code_url", material)
+    credential_dir = workspace_path / "data" / "codex_accounts"
+    credential_dir.mkdir(parents=True, exist_ok=True)
+    (credential_dir / "codex-owner@example.com-plus.json").write_text(
+        json.dumps(
+            {
+                "type": "codex",
+                "email": "owner@example.com",
+                "access_token": "preview-access-secret",
+                "refresh_token": "preview-refresh-secret",
+                "plan_type": "plus",
+            }
+        ),
+        encoding="utf-8",
+    )
+    account = client.get("/api/accounts").get_json()["accounts"][0]
+    endpoint = f"/api/accounts/{account['id']}/formats/reveal"
+
+    assert client.post(endpoint, json={}).status_code == 400
+    response = client.post(endpoint, json={"confirmed": True})
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["has_credential"] is True
+    assert [item["id"] for item in body["formats"]] == [
+        "original",
+        "codex_json",
+        "sub2api",
+    ]
+    assert body["formats"][0]["content"] == material
+    assert "preview-refresh-secret" in body["formats"][1]["content"]
+    sub2api = json.loads(body["formats"][2]["content"])
+    assert sub2api["accounts"][0]["credentials"]["access_token"] == (
+        "preview-access-secret"
+    )
 
 
 def test_code_url_can_be_opened_directly_from_local_inventory(workspace_path: Path):
@@ -444,6 +493,64 @@ def test_seller_inventory_export_status_and_quota(monkeypatch, workspace_path: P
 
     assert client.post("/api/seller/status", json={}).status_code == 404
     assert not (_settings(workspace_path).project_root / "templates" / "login.html").exists()
+
+
+def test_token_refresh_401_automatically_queues_credential_relogin(
+    monkeypatch, workspace_path: Path
+):
+    data_dir = workspace_path / "data"
+    mailbox = MailboxStore(data_dir)
+    mailbox.import_text(
+        "code_url", "owner@example.com----https://mail.test/owner"
+    )
+    account = mailbox.list_accounts()[0]
+    credential_dir = data_dir / "codex_accounts"
+    credential_dir.mkdir(parents=True)
+    (credential_dir / "codex-owner@example.com-plus.json").write_text(
+        json.dumps(
+            {
+                "type": "codex",
+                "email": "owner@example.com",
+                "access_token": "expired-access",
+                "refresh_token": "expired-refresh",
+                "plan_type": "plus",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "src.webapp.refresh_codex_credential_metadata",
+        lambda path, include_quota: (_ for _ in ()).throw(
+            RuntimeError("Token 刷新接口 HTTP 401")
+        ),
+    )
+    manager = FakeCodexManager()
+    app = create_app(
+        _settings(workspace_path), mailbox_store=mailbox, codex_manager=manager
+    )
+    client = app.test_client()
+
+    refreshed = client.post(
+        "/api/seller/subscription/refresh",
+        json={"account_ids": [account["id"]]},
+    )
+
+    assert refreshed.status_code == 200
+    body = refreshed.get_json()
+    assert body["failed"] == 1
+    assert body["relogin_required"] == 1
+    assert body["relogin_queued"] == 1
+    assert body["relogin_error"] == ""
+    assert body["relogin_pipeline"]["mode"] == "credential_reauth"
+    assert manager.pipeline["emails"] == ["owner@example.com"]
+    assert manager.pipeline["retry_limit"] == 1
+
+    manual = client.post(
+        "/api/seller/credentials/relogin",
+        json={"account_ids": [account["id"]]},
+    )
+    assert manual.status_code == 202
+    assert manual.get_json()["pipeline"]["mode"] == "credential_reauth"
 
 
 def test_seller_export_filters_by_phone_verification_time(workspace_path: Path):
@@ -870,6 +977,14 @@ def test_index_contains_sms_credential_visibility_toggle(workspace_path: Path):
     assert "运行日志" in html
     assert 'id="credentialSelectedCount"' in html
     assert 'id="sellerRefreshAllQuota"' in html
+    assert 'id="sellerReloginCredentials"' in html
+    assert "/api/seller/credentials/relogin" in html
+    assert "只刷新凭证，不重复接码" in html
+    assert 'id="accountFormatDialog"' in html
+    assert 'data-account-format="${esc(id)}"' in html
+    assert "/api/accounts/${encodeURIComponent(accountId)}/formats/reveal" in html
+    assert "Codex JSON" in html
+    assert "Sub2API" in html
     assert 'id="sellerRefreshSubscription"' in html
     assert 'id="sellerRefreshAllSubscriptions"' in html
     assert "/api/seller/subscription/refresh" in html

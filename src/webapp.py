@@ -952,6 +952,70 @@ def create_app(
     def _credential_payload_for_account(account_id: str) -> dict:
         return _credential_record_for_account(account_id)[2]
 
+    @app.post("/api/accounts/<account_id>/formats/reveal")
+    def reveal_account_formats(account_id: str):
+        """Return on-demand previews for every format available to one account."""
+        if not _is_loopback_host(settings.host):
+            return jsonify({"ok": False, "error": "账号格式仅允许从本机 WebUI 查看"}), 403
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict) or data.get("confirmed") is not True:
+            return jsonify({"ok": False, "error": "查看账号格式前必须明确确认"}), 400
+        try:
+            material = mailbox_store.reveal_original(account_id)
+        except (ValueError, KeyError) as exc:
+            return _selection_error(exc)
+
+        email = str(material.get("email") or "")
+        formats = [
+            {
+                "id": "original",
+                "label": "原始素材",
+                "filename": "account-original.txt",
+                "content": str(material.get("material") or ""),
+            }
+        ]
+        try:
+            _, credential_path, credential = _credential_record_for_account(account_id)
+        except KeyError:
+            credential_path = None
+            credential = None
+        except ValueError as exc:
+            return _selection_error(exc)
+        if credential_path is not None and credential is not None:
+            formats.extend(
+                [
+                    {
+                        "id": "codex_json",
+                        "label": "Codex JSON",
+                        "filename": credential_path.name,
+                        "content": json.dumps(
+                            credential, ensure_ascii=False, indent=2
+                        )
+                        + "\n",
+                    },
+                    {
+                        "id": "sub2api",
+                        "label": "Sub2API",
+                        "filename": "sub2api.json",
+                        "content": json.dumps(
+                            _sub2api_payload([(credential_path, credential_path.name)]),
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        + "\n",
+                    },
+                ]
+            )
+        return jsonify(
+            {
+                "ok": True,
+                "email": email,
+                "source": material.get("source") or "unknown",
+                "has_credential": credential is not None,
+                "formats": formats,
+            }
+        )
+
     def _refresh_account_metadata(account_id: str, *, include_quota: bool) -> dict:
         _, credential_path, _ = _credential_record_for_account(account_id)
         refreshed = refresh_codex_credential_metadata(
@@ -1053,6 +1117,49 @@ def create_app(
             raise ValueError("账号 ID 格式无效")
         return normalized
 
+    @staticmethod
+    def _metadata_result_requires_relogin(result: object) -> bool:
+        if not isinstance(result, dict):
+            return False
+        text = " ".join(
+            str(result.get(key) or "")
+            for key in ("subscription_error", "error")
+        ).casefold()
+        return "token 刷新接口 http 401" in text
+
+    def _start_credential_relogin(account_ids: list[str]) -> dict:
+        emails = []
+        for account_id in account_ids:
+            account = mailbox_store.get_secret(account_id=account_id)
+            if account is None:
+                raise KeyError("所选账号不存在")
+            emails.append(str(account.get("email") or ""))
+        starter = getattr(codex_manager, "start_batch", None)
+        if not callable(starter):
+            raise RuntimeError("当前任务管理器不支持重新登录")
+        return starter(
+            emails,
+            concurrency=max(1, min(5, len(emails))),
+            retry_limit=1,
+            retry_backoff_seconds=30,
+            reauth=True,
+        )
+
+    def _queue_failed_token_relogins(
+        account_ids: list[str], results: dict[str, dict]
+    ) -> tuple[list[str], dict | None, str]:
+        required = [
+            account_id
+            for account_id in account_ids
+            if _metadata_result_requires_relogin(results.get(account_id))
+        ]
+        if not required:
+            return [], None, ""
+        try:
+            return required, _start_credential_relogin(required), ""
+        except Exception as exc:
+            return required, None, f"{type(exc).__name__}: {exc}"
+
     @app.get("/api/seller/inventory")
     def seller_inventory():
         # Inventory is account-centric: imported accounts remain manageable
@@ -1106,6 +1213,9 @@ def create_app(
             for future in as_completed(futures):
                 account_id, result = future.result()
                 results[account_id] = result
+        relogin_ids, relogin_pipeline, relogin_error = _queue_failed_token_relogins(
+            normalized, results
+        )
         success = sum(
             item.get("status") == "ok"
             and item.get("subscription_status") == "ok"
@@ -1118,6 +1228,10 @@ def create_app(
                 "results": results,
                 "success": success,
                 "failed": len(results) - success,
+                "relogin_required": len(relogin_ids),
+                "relogin_queued": len(relogin_ids) if relogin_pipeline else 0,
+                "relogin_pipeline": relogin_pipeline,
+                "relogin_error": relogin_error,
             }
         )
 
@@ -1143,6 +1257,9 @@ def create_app(
             for future in as_completed(futures):
                 account_id, result = future.result()
                 results[account_id] = result
+        relogin_ids, relogin_pipeline, relogin_error = _queue_failed_token_relogins(
+            normalized, results
+        )
         success = sum(
             item.get("subscription_status") == "ok" for item in results.values()
         )
@@ -1153,8 +1270,26 @@ def create_app(
                 "results": results,
                 "success": success,
                 "failed": len(results) - success,
+                "relogin_required": len(relogin_ids),
+                "relogin_queued": len(relogin_ids) if relogin_pipeline else 0,
+                "relogin_pipeline": relogin_pipeline,
+                "relogin_error": relogin_error,
             }
         )
+
+    @app.post("/api/seller/credentials/relogin")
+    def relogin_seller_credentials():
+        data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请提交 JSON 对象"}), 400
+        try:
+            normalized = _requested_inventory_account_ids(data, "重新登录刷新凭证")
+            pipeline = _start_credential_relogin(normalized)
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
+        return jsonify(
+            {"ok": True, "queued": len(normalized), "pipeline": pipeline}
+        ), 202
 
     @app.post("/api/seller/export")
     def export_inventory_accounts():

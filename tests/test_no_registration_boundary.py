@@ -116,6 +116,66 @@ def test_run_codex_only_passes_custom_email_otp_provider(monkeypatch):
     assert restored == [FakeCodex.sms_provider]
 
 
+def test_credential_reauth_skips_sms_patch_and_phone_verification(monkeypatch):
+    calls = {}
+    cleaned = []
+
+    class FakeCodex:
+        sms_provider = object()
+
+        @staticmethod
+        def run_codex_oauth(
+            email, otp_provider, proxy, force, skip_phone_verification=False
+        ):
+            calls.update(
+                email=email,
+                proxy=proxy,
+                force=force,
+                skip_phone_verification=skip_phone_verification,
+                otp=otp_provider(email, 123.0),
+            )
+            return {"ok": True, "status": "success", "file_path": "credential.json"}
+
+    monkeypatch.setattr(upstream_bridge, "_ensure_upstream_imports", lambda settings: FakeCodex())
+    monkeypatch.setattr(
+        upstream_bridge,
+        "install_hero_sms_patch",
+        lambda provider: (_ for _ in ()).throw(AssertionError("SMS patch must not run")),
+    )
+    monkeypatch.setattr(
+        upstream_bridge,
+        "_outlook_otp_provider",
+        lambda mailbox: (
+            lambda email, after_ts, **kwargs: "654321",
+            lambda: cleaned.append(True),
+        ),
+    )
+    project_root = Path(__file__).resolve().parents[1]
+    settings = SimpleNamespace(project_root=project_root, data_dir=project_root / "data")
+
+    result = upstream_bridge.run_codex_only(
+        settings,
+        {
+            "source": "outlook",
+            "email": "owner@example.com",
+            "password": "mail-pass",
+            "client_id": "client",
+            "refresh_token": "refresh",
+        },
+        reauth=True,
+    )
+
+    assert result["ok"] is True
+    assert calls == {
+        "email": "owner@example.com",
+        "proxy": None,
+        "force": True,
+        "skip_phone_verification": True,
+        "otp": "654321",
+    }
+    assert cleaned == [True]
+
+
 def test_generic_api_otp_provider_uses_extended_wait_and_disables_resend(monkeypatch):
     project_root = Path(__file__).resolve().parents[1]
     settings = SimpleNamespace(project_root=project_root, data_dir=project_root / "data")

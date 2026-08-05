@@ -141,7 +141,7 @@ def _generic_api_otp_provider(mailbox: dict) -> tuple[Callable, Callable[[], Non
     return get_otp, cleanup
 
 
-def run_codex_only(settings: Settings, mailbox: dict) -> dict:
+def run_codex_only(settings: Settings, mailbox: dict, *, reauth: bool = False) -> dict:
     """Run only the upstream existing-account Codex OAuth entrypoint."""
 
     email = str(mailbox.get("email") or "").strip()
@@ -170,11 +170,12 @@ def run_codex_only(settings: Settings, mailbox: dict) -> dict:
     sms_provider = getattr(codex_oauth, "sms_provider", None)
     hero_patch = None
     try:
-        if sms_provider is None:
-            raise RuntimeError("原项目未提供短信生命周期模块，无法启用 Hero SMS")
-        hero_patch = install_hero_sms_patch(sms_provider)
-        if hero_patch is None:
-            raise RuntimeError("Hero SMS 适配器安装失败，已阻止使用其他接码平台")
+        if not reauth:
+            if sms_provider is None:
+                raise RuntimeError("原项目未提供短信生命周期模块，无法启用 Hero SMS")
+            hero_patch = install_hero_sms_patch(sms_provider)
+            if hero_patch is None:
+                raise RuntimeError("Hero SMS 适配器安装失败，已阻止使用其他接码平台")
         # 这是原项目的 Codex 补跑入口；不导入也不调用 main.run_registration。
         kwargs = {
             "otp_provider": otp_provider,
@@ -183,6 +184,8 @@ def run_codex_only(settings: Settings, mailbox: dict) -> dict:
         }
         if source == "password_totp":
             kwargs.update(password=password, totp_provider=totp_provider)
+        if reauth:
+            kwargs["skip_phone_verification"] = True
         result = codex_oauth.run_codex_oauth(email, **kwargs)
     finally:
         try:

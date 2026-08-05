@@ -139,6 +139,60 @@ def test_pipeline_honors_concurrency_and_retries_only_transient_failures(tmp_pat
     assert "https://mail.test" not in state_text
 
 
+def test_reauth_pipeline_skips_phone_mode_and_preserves_phone_state(tmp_path: Path):
+    mailbox_store, emails = _mailboxes(tmp_path, count=1)
+    mailbox_store.update_codex(
+        emails[0],
+        status="success",
+        phone_verified=True,
+        phone_number="+84123456789",
+    )
+    manager = CodexJobManager(_settings(tmp_path), mailbox_store)
+    manager.availability = lambda **kwargs: {"available": True, "reason": ""}
+    observed = {}
+
+    def handler(task):
+        observed.update(reauth=task.get("reauth"), email=task["mailbox"]["email"])
+        Path(task["log_path"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(task["log_path"]).write_text("credential refreshed", encoding="utf-8")
+        return {
+            "dispatch_id": task["dispatch_id"],
+            "job_id": task["job_id"],
+            "attempt": task["attempt"],
+            "result": {
+                "ok": True,
+                "status": "success",
+                "message": "credential refreshed",
+                "file_path": str(tmp_path / "credential.json"),
+            },
+        }
+
+    _install_fake_workers(manager, handler=handler, worker_count=1)
+    pipeline = manager.start_batch(
+        emails,
+        concurrency=1,
+        retry_limit=1,
+        reauth=True,
+    )
+
+    finished = _wait_for(
+        lambda: (
+            value
+            if not (value := manager.pipeline_overview(pipeline["id"]))["active"]
+            else None
+        )
+    )
+
+    assert finished["status"] == "completed"
+    assert finished["mode"] == "credential_reauth"
+    assert observed == {"reauth": True, "email": emails[0]}
+    job = manager.list_jobs()[0]
+    assert job["stage"] == "凭证已刷新"
+    saved = mailbox_store.get_secret(email=emails[0])
+    assert saved["phone_verified"] is True
+    assert saved["phone_number"] == "+84123456789"
+
+
 def test_pipeline_stop_cancels_queued_but_preserves_running_result(tmp_path: Path):
     mailbox_store, emails = _mailboxes(tmp_path, count=2)
     manager = CodexJobManager(_settings(tmp_path), mailbox_store)

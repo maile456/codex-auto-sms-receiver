@@ -79,17 +79,21 @@ def worker_main(settings, task_queue, result_queue) -> None:
                     "worker_pid": os.getpid(),
                 }
             )
+            reauth = bool(task.get("reauth"))
             logging.getLogger(__name__).info(
-                "Pipeline worker start: source=%s attempt=%s",
+                "Pipeline worker start: source=%s attempt=%s reauth=%s",
                 mailbox.get("source"),
                 attempt,
+                reauth,
             )
             result_queue.put(
                 {
                     "dispatch_id": dispatch_id,
                     "job_id": job_id,
                     "attempt": attempt,
-                    "result": _safe_result(run_codex_only(settings, mailbox)),
+                    "result": _safe_result(
+                        run_codex_only(settings, mailbox, reauth=reauth)
+                    ),
                 }
             )
         except Exception as exc:

@@ -78,7 +78,7 @@ class CodexJobManager:
 
         self._success_callback = callback
 
-    def availability(self) -> dict:
+    def availability(self, *, reauth: bool = False) -> dict:
         if not (self.upstream_root / "core" / "codex_oauth.py").is_file():
             return {"available": False, "reason": "未找到原项目 core/codex_oauth.py"}
         missing = [name for name in ("curl_cffi", "Crypto", "pyotp") if importlib.util.find_spec(name) is None]
@@ -90,13 +90,13 @@ class CodexJobManager:
             return {"available": False, "reason": "此独立项目仅支持 CODEX_OAUTH_DRIVER=protocol"}
         if auth_source == "cpa" and not os.getenv("CPA_MANAGEMENT_KEY", "").strip():
             return {"available": False, "reason": "CPA 模式缺少 CPA_MANAGEMENT_KEY"}
-        if not os.getenv("HERO_SMS_API_KEY", "").strip():
+        if not reauth and not os.getenv("HERO_SMS_API_KEY", "").strip():
             return {"available": False, "reason": "Hero SMS 缺少 HERO_SMS_API_KEY"}
         try:
             countries = normalize_hero_countries(os.getenv("HERO_SMS_COUNTRIES", ""))
         except ValueError:
             countries = []
-        if not countries:
+        if not reauth and not countries:
             return {"available": False, "reason": "Hero SMS 至少需要选择 1 个国家"}
         return {"available": True, "reason": ""}
 
@@ -358,6 +358,7 @@ class CodexJobManager:
         concurrency: int = 1,
         retry_limit: int = 0,
         retry_backoff_seconds: int = 30,
+        reauth: bool = False,
     ) -> dict[str, Any]:
         try:
             concurrency = int(concurrency)
@@ -385,7 +386,8 @@ class CodexJobManager:
             raise ValueError("请至少选择 1 个账号")
         if len(normalized) > self._MAX_BATCH_SIZE:
             raise ValueError(f"单批最多处理 {self._MAX_BATCH_SIZE} 个账号")
-        availability = self.availability()
+        reauth = bool(reauth)
+        availability = self.availability(reauth=True) if reauth else self.availability()
         if not availability["available"]:
             raise RuntimeError(availability["reason"])
 
@@ -432,6 +434,7 @@ class CodexJobManager:
                     "log_paths": [],
                     "credential_path": None,
                     "phone_verified": False,
+                    "reauth": reauth,
                 }
             self._pipelines[pipeline_id] = {
                 "id": pipeline_id,
@@ -440,6 +443,7 @@ class CodexJobManager:
                 "retry_limit": retry_limit,
                 "retry_backoff_seconds": retry_backoff_seconds,
                 "attempt_timeout_seconds": self._attempt_timeout_seconds(),
+                "mode": "credential_reauth" if reauth else "login_and_verify",
                 "pause_requested": False,
                 "stop_requested": False,
                 "created_at": created_at,
@@ -514,8 +518,12 @@ class CodexJobManager:
         attempt_started_at = _now()
         job.update(
             status="running",
-            stage="登录与授权",
-            message=f"正在执行第 {attempt}/{job['max_attempts']} 次",
+            stage="重新登录刷新凭证" if job.get("reauth") else "登录与授权",
+            message=(
+                f"正在重新登录刷新凭证（第 {attempt}/{job['max_attempts']} 次）"
+                if job.get("reauth")
+                else f"正在执行第 {attempt}/{job['max_attempts']} 次"
+            ),
             retryable=False,
             next_retry_at=None,
             started_at=job.get("started_at") or _now(),
@@ -528,7 +536,11 @@ class CodexJobManager:
         self.mailbox_store.update_codex(
             str(job.get("email") or ""),
             status="running",
-            message=f"流水线执行中（第 {attempt}/{job['max_attempts']} 次）",
+            message=(
+                f"正在重新登录刷新凭证（第 {attempt}/{job['max_attempts']} 次）"
+                if job.get("reauth")
+                else f"流水线执行中（第 {attempt}/{job['max_attempts']} 次）"
+            ),
         )
         self._task_queue.put(
             {
@@ -537,6 +549,7 @@ class CodexJobManager:
                 "attempt": attempt,
                 "mailbox": mailbox,
                 "log_path": str(log_path),
+                "reauth": bool(job.get("reauth")),
             }
         )
         self._active_dispatches[dispatch_id] = {
@@ -630,9 +643,10 @@ class CodexJobManager:
 
         if status == "success":
             phone_number = self._phone_from_log(job.get("log_path"))
+            reauth = bool(job.get("reauth"))
             job.update(
                 status="success",
-                stage="已完成",
+                stage="凭证已刷新" if reauth else "已完成",
                 message=message[:500],
                 credential_path=credential_path,
                 phone_verified=bool(phone_number),
@@ -649,8 +663,8 @@ class CodexJobManager:
                 status="success",
                 message=message[:500],
                 credential_path=credential_path,
-                phone_verified=bool(phone_number),
-                phone_number=phone_number or None,
+                phone_verified=None if reauth else bool(phone_number),
+                phone_number=None if reauth else (phone_number or None),
             )
             if self._success_callback is not None:
                 try:

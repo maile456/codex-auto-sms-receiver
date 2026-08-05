@@ -129,3 +129,14 @@ def test_no_password_login_switches_to_email_otp_before_polling(monkeypatch, tmp
         "poll_code_url",
     ]
     assert "validate_otp:123456" in events
+    assert events.count("phone") == 1
+
+    refreshed = codex_oauth.run_codex_oauth(
+        "owner@example.test",
+        otp_provider=otp_provider,
+        force=True,
+        skip_phone_verification=True,
+    )
+
+    assert refreshed["ok"] is True
+    assert events.count("phone") == 1

@@ -1447,6 +1447,7 @@ def run_codex_oauth(
     _cpa_reauth_round: int = 1,
     password: str | None = None,
     totp_provider=None,
+    skip_phone_verification: bool = False,
 ) -> dict:
     """
     注册成功后的 Codex OAuth 授权入口（全新 session + 接码方案）。
@@ -1631,9 +1632,13 @@ def run_codex_oauth(
             _submit_email_otp(session, email_otp)
             human_delay("api")
 
-        # 5. 手机号验证（接码，自动重试换号）
-        _do_phone_verification(session)
-        human_delay("post_auth")
+        # 5. 首次授权需要手机号验证；旧 refresh_token 已失效后的
+        # 重新登录只更新 OAuth 凭证，保留账号原有手机验证状态，不重复接码。
+        if skip_phone_verification:
+            logger.info("[Codex] 重新登录刷新凭证：跳过重复手机号验证")
+        else:
+            _do_phone_verification(session)
+            human_delay("post_auth")
 
         # 6. 选 workspace → 拿 callback code
         callback_url = _select_workspace_and_get_callback(session, state)
