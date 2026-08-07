@@ -7,6 +7,7 @@
 ## 已确认环境与边界
 
 - 操作系统：Windows，入口兼容 Windows PowerShell 5.1。
+- 根目录 CMD 按钮使用 CRLF 换行；包含中文消息的 PowerShell 脚本使用带 BOM 的 UTF-8，确保 Windows PowerShell 5.1 正确解析。
 - Python：使用 Python 3.10 或更高版本创建根目录下的 `.venv`。
 - 服务地址固定为 `http://127.0.0.1:5015`，不监听局域网或公网地址。
 - 健康检查使用项目已有的 `GET /health`。
@@ -38,7 +39,7 @@
 
 - 定位项目根目录、`.venv\Scripts\python.exe`、绝对路径 `app.py`、`data/server.pid` 和启动日志。
 - 如果虚拟环境或 `.env` 不存在，给出明确的部署缺失提示并退出，不在每次启动时重新安装依赖。
-- 读取 PID 文件并通过 CIM 校验：可执行文件必须是项目 `.venv` 中的 Python，命令行必须包含本项目 `app.py` 的绝对路径。
+- 读取 PID 文件并通过 CIM 校验：命令行必须包含本项目 `app.py` 的绝对路径，且该进程本身或其直接父进程必须是项目 `.venv` 中的 Python。此规则兼容 Windows Python 虚拟环境 redirector。
 - 如果已确认是本项目且 `/health` 正常，则不重复创建进程，只打开 WebUI。
 - 如果 `5015` 已被其他程序占用，拒绝启动并提示端口冲突，不尝试结束占用者。
 - 使用隐藏窗口启动项目专属 Python，标准输出和标准错误分别写入 `logs/server.stdout.log` 与 `logs/server.stderr.log`。
@@ -47,7 +48,7 @@
 ### `ops/local/Stop-Local.ps1`
 
 - 优先读取项目自己的 `data/server.pid`。
-- 在终止前进行与启动脚本相同的双重身份校验：项目虚拟环境 Python + 本项目 `app.py` 绝对路径。
+- 在终止前进行与启动脚本相同的双重身份校验：本项目 `app.py` 绝对路径 + 当前进程或直接父进程属于项目虚拟环境 Python。
 - 校验通过后终止该进程树，覆盖流水线可能创建的子进程；不使用 `taskkill /IM python.exe` 等按名称批量终止方式。
 - 最多等待 10 秒确认 `/health` 不再可达，并清理属于已停止实例的 PID 文件。
 - PID 文件缺失或进程已不存在且健康检查也不可达时，返回“服务已经关闭”。

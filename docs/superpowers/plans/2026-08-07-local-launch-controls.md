@@ -14,7 +14,8 @@
 - Use the repository-local `.venv`; do not install packages into the system Python environment.
 - Never overwrite an existing `.env`, and never put HeroSMS keys or account material into scripts, logs, tests, or Git.
 - `启动.cmd` and `关闭.cmd` must work when double-clicked from Explorer and when the caller's current directory is elsewhere.
-- Stop only a process whose executable is `.venv\Scripts\python.exe` and whose command line contains the absolute repository `app.py` path.
+- Save CMD launchers with CRLF line endings and PowerShell scripts as UTF-8 with BOM for Windows PowerShell 5.1 compatibility.
+- Stop only a process whose command line contains the absolute repository `app.py` path and whose executable or direct parent executable is `.venv\Scripts\python.exe`.
 - Refuse to terminate a reused or mismatched PID.
 - Do not add Windows service registration, startup tasks, a reverse proxy, or public exposure.
 
@@ -137,10 +138,9 @@ def _run_control(script: Path, *arguments: str) -> subprocess.CompletedProcess[s
             *arguments,
         ],
         cwd=ROOT,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         timeout=45,
         check=False,
     )
@@ -154,10 +154,9 @@ def _run_button(
     return subprocess.run(
         ["cmd.exe", "/d", "/c", str(button), *arguments],
         cwd=cwd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         timeout=45,
         check=False,
     )
@@ -304,9 +303,11 @@ if errorlevel 1 (
 exit /b 0
 ```
 
+Save both CMD files with CRLF line endings.
+
 - [ ] **Step 2: Implement `ops/local/Start-Local.ps1`**
 
-Create `ops/local/Start-Local.ps1` with:
+Create `ops/local/Start-Local.ps1` as UTF-8 with BOM using:
 
 ```powershell
 [CmdletBinding()]
@@ -344,22 +345,42 @@ function Get-ProjectProcess {
     param([int]$CandidateId)
 
     $candidate = Get-CandidateProcess -CandidateId $CandidateId
-    if ($null -eq $candidate -or [string]::IsNullOrWhiteSpace([string]$candidate.ExecutablePath)) {
+    if ($null -eq $candidate -or [string]::IsNullOrWhiteSpace([string]$candidate.CommandLine)) {
         return $null
     }
-    $actualExecutable = [IO.Path]::GetFullPath([string]$candidate.ExecutablePath)
+    if ($candidate.CommandLine.IndexOf(
+        $script:AppPath,
+        [StringComparison]::OrdinalIgnoreCase
+    ) -lt 0) {
+        return $null
+    }
     $expectedExecutable = [IO.Path]::GetFullPath($script:PythonPath)
+    if (-not [string]::IsNullOrWhiteSpace([string]$candidate.ExecutablePath)) {
+        $actualExecutable = [IO.Path]::GetFullPath([string]$candidate.ExecutablePath)
+        if ([string]::Equals(
+            $actualExecutable,
+            $expectedExecutable,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+            return $candidate
+        }
+    }
+    $parent = Get-CandidateProcess -CandidateId $candidate.ParentProcessId
+    if ($null -eq $parent -or [string]::IsNullOrWhiteSpace([string]$parent.ExecutablePath)) {
+        return $null
+    }
+    $parentExecutable = [IO.Path]::GetFullPath([string]$parent.ExecutablePath)
     if (-not [string]::Equals(
-        $actualExecutable,
+        $parentExecutable,
         $expectedExecutable,
         [StringComparison]::OrdinalIgnoreCase
     )) {
         return $null
     }
-    if ([string]::IsNullOrWhiteSpace([string]$candidate.CommandLine)) {
+    if ([string]::IsNullOrWhiteSpace([string]$parent.CommandLine)) {
         return $null
     }
-    if ($candidate.CommandLine.IndexOf(
+    if ($parent.CommandLine.IndexOf(
         $script:AppPath,
         [StringComparison]::OrdinalIgnoreCase
     ) -lt 0) {
@@ -467,11 +488,15 @@ function Invoke-StartLocal {
         while ([DateTime]::UtcNow -lt $deadline) {
             if (Test-ServiceHealth) {
                 $writtenProcessId = Get-ServerProcessId
-                if ($writtenProcessId -ne $started.Id) {
-                    throw "服务已响应，但 PID 文件与本次启动进程不一致。"
-                }
-                if ($null -eq (Get-ProjectProcess -CandidateId $started.Id)) {
+                $owned = Get-ProjectProcess -CandidateId $writtenProcessId
+                if ($null -eq $owned) {
                     throw "服务已响应，但无法确认进程属于本项目。"
+                }
+                if (
+                    $writtenProcessId -ne $started.Id -and
+                    $owned.ParentProcessId -ne $started.Id
+                ) {
+                    throw "服务已响应，但 PID 不是本次启动进程或其直接子进程。"
                 }
                 $ready = $true
                 Write-Host "[成功] 服务已启动：$script:WebUrl" -ForegroundColor Green
@@ -513,7 +538,7 @@ catch {
 
 - [ ] **Step 3: Implement `ops/local/Stop-Local.ps1`**
 
-Create `ops/local/Stop-Local.ps1` with:
+Create `ops/local/Stop-Local.ps1` as UTF-8 with BOM using:
 
 ```powershell
 [CmdletBinding()]
@@ -543,22 +568,42 @@ function Get-ProjectProcess {
     param([int]$CandidateId)
 
     $candidate = Get-CandidateProcess -CandidateId $CandidateId
-    if ($null -eq $candidate -or [string]::IsNullOrWhiteSpace([string]$candidate.ExecutablePath)) {
+    if ($null -eq $candidate -or [string]::IsNullOrWhiteSpace([string]$candidate.CommandLine)) {
         return $null
     }
-    $actualExecutable = [IO.Path]::GetFullPath([string]$candidate.ExecutablePath)
+    if ($candidate.CommandLine.IndexOf(
+        $script:AppPath,
+        [StringComparison]::OrdinalIgnoreCase
+    ) -lt 0) {
+        return $null
+    }
     $expectedExecutable = [IO.Path]::GetFullPath($script:PythonPath)
+    if (-not [string]::IsNullOrWhiteSpace([string]$candidate.ExecutablePath)) {
+        $actualExecutable = [IO.Path]::GetFullPath([string]$candidate.ExecutablePath)
+        if ([string]::Equals(
+            $actualExecutable,
+            $expectedExecutable,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+            return $candidate
+        }
+    }
+    $parent = Get-CandidateProcess -CandidateId $candidate.ParentProcessId
+    if ($null -eq $parent -or [string]::IsNullOrWhiteSpace([string]$parent.ExecutablePath)) {
+        return $null
+    }
+    $parentExecutable = [IO.Path]::GetFullPath([string]$parent.ExecutablePath)
     if (-not [string]::Equals(
-        $actualExecutable,
+        $parentExecutable,
         $expectedExecutable,
         [StringComparison]::OrdinalIgnoreCase
     )) {
         return $null
     }
-    if ([string]::IsNullOrWhiteSpace([string]$candidate.CommandLine)) {
+    if ([string]::IsNullOrWhiteSpace([string]$parent.CommandLine)) {
         return $null
     }
-    if ($candidate.CommandLine.IndexOf(
+    if ($parent.CommandLine.IndexOf(
         $script:AppPath,
         [StringComparison]::OrdinalIgnoreCase
     ) -lt 0) {
