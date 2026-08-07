@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import zipfile
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -15,12 +17,16 @@ from manager.upstream_sync import (
     SyncError,
     UpstreamSpec,
     UpdateStatus,
+    apply_transaction,
     bootstrap_lock,
     check_updates,
+    finalize_transaction,
     git_blob_sha,
     load_lock,
     main,
+    plan_update,
     resolve_inside,
+    rollback_transaction,
     safe_repo_path,
     validate_upstream_paths,
     verify_extracted_tree,
@@ -490,3 +496,267 @@ def test_bootstrap_lock_rejects_new_protected_collision_without_writing(tmp_path
         bootstrap_lock(tmp_path, lock_path, client)
 
     assert lock_path.read_bytes() == before
+
+
+def zip_bytes(files: dict[str, bytes], *, root: str = "project-snapshot") -> bytes:
+    stream = BytesIO()
+    with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, body in files.items():
+            archive.writestr(f"{root}/{name}", body)
+    return stream.getvalue()
+
+
+class FakeUpdateClient(FakeLatestClient):
+    def __init__(
+        self,
+        *,
+        repository: str,
+        commit: RemoteCommit,
+        tree: RemoteTree,
+        archive: bytes,
+        transient_failures: int = 0,
+    ):
+        super().__init__({repository: commit})
+        self.repository = repository
+        self.tree = tree
+        self.archive = archive
+        self.transient_failures = transient_failures
+        self.download_attempts = 0
+
+    def commit_tree(self, repository: str, commit: str) -> RemoteTree:
+        assert repository == self.repository
+        return self.tree
+
+    def download_archive(self, repository: str, commit: str) -> bytes:
+        assert repository == self.repository
+        self.download_attempts += 1
+        if self.download_attempts <= self.transient_failures:
+            raise SyncError("temporary download failure")
+        return self.archive
+
+
+def transaction_workspace(tmp_path: Path):
+    (tmp_path / "change.txt").write_bytes(b"old change\n")
+    (tmp_path / "delete.txt").write_bytes(b"old delete\n")
+    (tmp_path / "manager").mkdir()
+    (tmp_path / "manager" / "local.py").write_bytes(b"integration\n")
+    (tmp_path / ".env").write_bytes(b"LOCAL_SECRET=fixture\n")
+    credentials = tmp_path / "data" / "codex_accounts"
+    credentials.mkdir(parents=True)
+    (credentials / "credential.json").write_bytes(b'{"fixture":true}\n')
+    lock_path = tmp_path / "manager" / "upstreams.lock.json"
+    write_lock(
+        lock_path,
+        upstreams=[
+            lock_row(
+                files=[
+                    entry("change.txt", b"old change\n").as_dict(),
+                    entry("delete.txt", b"old delete\n").as_dict(),
+                ]
+            )
+        ],
+        protected=["manager/", ".env", "data/", "logs/"],
+    )
+    remote = RemoteCommit(
+        sha="2" * 40,
+        title="fixture update",
+        committed_at="2026-08-08T00:00:00Z",
+    )
+    tree = RemoteTree(
+        rows=(
+            tree_for("add.txt", b"new add\n"),
+            tree_for("change.txt", b"new change\n"),
+        ),
+        truncated=False,
+    )
+    client = FakeUpdateClient(
+        repository="owner/project",
+        commit=remote,
+        tree=tree,
+        archive=zip_bytes({"add.txt": b"new add\n", "change.txt": b"new change\n"}),
+        transient_failures=1,
+    )
+    return lock_path, client
+
+
+def test_transaction_plans_applies_and_rolls_back_exact_managed_files(tmp_path):
+    lock_path, client = transaction_workspace(tmp_path)
+    old_lock = lock_path.read_bytes()
+    protected_before = {
+        "manager/local.py": (tmp_path / "manager" / "local.py").read_bytes(),
+        ".env": (tmp_path / ".env").read_bytes(),
+        "credential": (tmp_path / "data" / "codex_accounts" / "credential.json").read_bytes(),
+    }
+
+    transaction_path = plan_update(
+        tmp_path, lock_path, "receiver", client, sleeper=lambda _seconds: None
+    )
+
+    transaction = json.loads(transaction_path.read_text(encoding="utf-8"))
+    assert transaction["state"] == "planned"
+    assert transaction["updates"][0]["added"] == ["add.txt"]
+    assert transaction["updates"][0]["changed"] == ["change.txt"]
+    assert transaction["updates"][0]["deleted"] == ["delete.txt"]
+    assert client.download_attempts == 2
+    assert (tmp_path / "change.txt").read_bytes() == b"old change\n"
+    assert (tmp_path / "delete.txt").read_bytes() == b"old delete\n"
+    assert not (tmp_path / "add.txt").exists()
+    backup_dir = Path(transaction["backup_dir"])
+    assert backup_dir.is_dir()
+    assert (backup_dir / "lock.json").read_bytes() == old_lock
+
+    (transaction_path.parent / "service-stopped.marker").write_text("ok\n", encoding="utf-8")
+    apply_transaction(tmp_path, transaction_path)
+
+    assert (tmp_path / "add.txt").read_bytes() == b"new add\n"
+    assert (tmp_path / "change.txt").read_bytes() == b"new change\n"
+    assert not (tmp_path / "delete.txt").exists()
+    assert load_lock(lock_path).upstreams[0].commit == "2" * 40
+    assert (tmp_path / "manager" / "local.py").read_bytes() == protected_before["manager/local.py"]
+    assert (tmp_path / ".env").read_bytes() == protected_before[".env"]
+    assert (
+        tmp_path / "data" / "codex_accounts" / "credential.json"
+    ).read_bytes() == protected_before["credential"]
+
+    rollback_transaction(tmp_path, transaction_path)
+    rollback_transaction(tmp_path, transaction_path)
+
+    assert (tmp_path / "change.txt").read_bytes() == b"old change\n"
+    assert (tmp_path / "delete.txt").read_bytes() == b"old delete\n"
+    assert not (tmp_path / "add.txt").exists()
+    assert lock_path.read_bytes() == old_lock
+    assert json.loads(transaction_path.read_text(encoding="utf-8"))["state"] == "rolled_back"
+
+
+def test_apply_requires_service_stopped_marker(tmp_path):
+    lock_path, client = transaction_workspace(tmp_path)
+    transaction_path = plan_update(
+        tmp_path, lock_path, "receiver", client, sleeper=lambda _seconds: None
+    )
+    with pytest.raises(SyncError, match="service-stopped.marker"):
+        apply_transaction(tmp_path, transaction_path)
+    assert (tmp_path / "change.txt").read_bytes() == b"old change\n"
+
+
+def test_plan_rejects_existing_local_path_for_remote_addition(tmp_path):
+    lock_path, client = transaction_workspace(tmp_path)
+    (tmp_path / "add.txt").write_bytes(b"local integration\n")
+
+    with pytest.raises(SyncError, match="本地清单外路径冲突: add.txt"):
+        plan_update(tmp_path, lock_path, "receiver", client, sleeper=lambda _seconds: None)
+
+    assert (tmp_path / "add.txt").read_bytes() == b"local integration\n"
+    backups = tmp_path / "data" / "upstream-backups"
+    assert not backups.exists() or not any(backups.iterdir())
+
+
+def test_rollback_of_unapplied_plan_preserves_later_local_file(tmp_path):
+    lock_path, client = transaction_workspace(tmp_path)
+    transaction_path = plan_update(
+        tmp_path, lock_path, "receiver", client, sleeper=lambda _seconds: None
+    )
+    (tmp_path / "add.txt").write_bytes(b"created after plan\n")
+
+    rollback_transaction(tmp_path, transaction_path)
+
+    assert (tmp_path / "add.txt").read_bytes() == b"created after plan\n"
+
+
+def test_finalize_requires_test_and_health_markers(tmp_path):
+    lock_path, client = transaction_workspace(tmp_path)
+    transaction_path = plan_update(
+        tmp_path, lock_path, "receiver", client, sleeper=lambda _seconds: None
+    )
+    (transaction_path.parent / "service-stopped.marker").write_text("ok\n", encoding="utf-8")
+    apply_transaction(tmp_path, transaction_path)
+    with pytest.raises(SyncError, match="tests-passed.marker"):
+        finalize_transaction(tmp_path, transaction_path)
+    (transaction_path.parent / "tests-passed.marker").write_text("ok\n", encoding="utf-8")
+    with pytest.raises(SyncError, match="health-passed.marker"):
+        finalize_transaction(tmp_path, transaction_path)
+    (transaction_path.parent / "health-passed.marker").write_text("ok\n", encoding="utf-8")
+    transaction_id = transaction_path.parent.name
+
+    finalize_transaction(tmp_path, transaction_path)
+
+    assert not transaction_path.parent.exists()
+    log_path = tmp_path / "data" / "upstream-update-logs" / f"{transaction_id}.json"
+    log = json.loads(log_path.read_text(encoding="utf-8"))
+    assert log["state"] == "complete"
+    assert log["updates"][0]["old_commit"] == "1" * 40
+    assert log["updates"][0]["new_commit"] == "2" * 40
+    assert Path(log["backup_dir"]).is_dir()
+    assert "credential" not in log_path.read_text(encoding="utf-8").casefold()
+
+
+@pytest.mark.parametrize("kind", ["traversal", "symlink", "blob-mismatch"])
+def test_plan_rejects_unsafe_or_unverified_archive_before_backup(tmp_path, kind):
+    lock_path, client = transaction_workspace(tmp_path)
+    if kind == "traversal":
+        client.archive = zip_bytes({"../escape.txt": b"escape\n"})
+    elif kind == "symlink":
+        stream = BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            info = zipfile.ZipInfo("project-snapshot/link")
+            info.create_system = 3
+            info.external_attr = 0o120777 << 16
+            archive.writestr(info, "target")
+        client.archive = stream.getvalue()
+        client.tree = RemoteTree(
+            rows=(
+                {
+                    "path": "link",
+                    "type": "blob",
+                    "mode": "120000",
+                    "size": 6,
+                    "sha": git_blob_sha(b"target"),
+                },
+            ),
+            truncated=False,
+        )
+    else:
+        client.archive = zip_bytes(
+            {"add.txt": b"wrong\n", "change.txt": b"new change\n"}
+        )
+
+    with pytest.raises(SyncError):
+        plan_update(tmp_path, lock_path, "receiver", client, sleeper=lambda _seconds: None)
+
+    backups = tmp_path / "data" / "upstream-backups"
+    assert not backups.exists() or not any(backups.iterdir())
+    assert (tmp_path / "change.txt").read_bytes() == b"old change\n"
+
+
+def test_transaction_cli_phases_emit_machine_readable_plan(tmp_path, capsys):
+    lock_path, client = transaction_workspace(tmp_path)
+
+    planned = main(
+        [
+            "plan-update",
+            "--workspace",
+            str(tmp_path),
+            "--lock",
+            str(lock_path),
+            "--project",
+            "receiver",
+        ],
+        client=client,
+        sleeper=lambda _seconds: None,
+    )
+    plan_output = json.loads(capsys.readouterr().out)
+    transaction_path = Path(plan_output["transaction"])
+
+    assert planned == 0
+    assert plan_output["update_count"] == 1
+    assert plan_output["projects"][0] == {
+        "key": "receiver",
+        "added": ["add.txt"],
+        "changed": ["change.txt"],
+        "deleted": ["delete.txt"],
+    }
+
+    (transaction_path.parent / "service-stopped.marker").write_text("ok\n", encoding="utf-8")
+    assert main(["apply", "--workspace", str(tmp_path), "--transaction", str(transaction_path)]) == 0
+    capsys.readouterr()
+    assert main(["rollback", "--workspace", str(tmp_path), "--transaction", str(transaction_path)]) == 0
+    assert "rolled_back" in capsys.readouterr().out
