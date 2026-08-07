@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from manager.credential_import import CredentialImportError, import_codex_documents
+from manager_app import create_managed_app
+from src.settings import Settings
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +44,24 @@ def codex_document(email: str | None, *, access: str | None = None) -> dict:
         },
         "last_refresh": "2026-08-08T00:00:00Z",
     }
+
+
+def settings_for(path: Path) -> Settings:
+    return Settings(
+        project_root=ROOT,
+        data_dir=path / "data",
+        log_dir=path / "logs",
+        browser_executable=None,
+        browser_timeout_seconds=120,
+        host="127.0.0.1",
+        port=5015,
+    )
+
+
+def managed_client(path: Path):
+    app = create_managed_app(settings_for(path), codex_manager=object())
+    app.config["TESTING"] = True
+    return app.test_client()
 
 
 def test_converter_snapshot_matches_pinned_upstream_blobs():
@@ -137,3 +157,92 @@ def test_import_rejects_non_string_access_token_without_leaking_value(tmp_path):
         import_codex_documents(document, tmp_path)
 
     assert "123456789" not in str(raised.value)
+
+
+def test_managed_app_preserves_receiver_and_adds_manager_routes(tmp_path):
+    client = managed_client(tmp_path)
+
+    assert client.get("/").status_code == 200
+    assert client.get("/health").get_json()["ok"] is True
+    manager = client.get("/manager")
+    page = manager.get_data(as_text=True)
+    assert manager.status_code == 200
+    assert "接码与 OAuth 管理" in page
+    assert "Session / Token 格式转换" in page
+    assert 'href="/"' in page
+    assert 'href="/tools/session-converter/"' in page
+
+
+def test_manager_status_exposes_pins_without_credentials(tmp_path):
+    credential_dir = tmp_path / "data" / "codex_accounts"
+    credential_dir.mkdir(parents=True)
+    (credential_dir / "fixture.json").write_text(
+        json.dumps(codex_document("status@example.com")),
+        encoding="utf-8",
+    )
+
+    response = managed_client(tmp_path).get("/api/manager/status")
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["ok"] is True
+    assert body["credential_count"] == 1
+    assert {item["key"]: item["current_sha"] for item in body["projects"]} == {
+        "receiver": "269bf3cd088b075f164ad2fe8e674b8b72a9fd26",
+        "converter": "a097eb155bb7bdf6cbbc26f1e4e75e120ab3163c",
+    }
+    assert "fixture-refresh-not-a-real-token" not in response.get_data(as_text=True)
+
+
+def test_converter_route_injects_bridge_without_modifying_vendor(tmp_path):
+    before = git_blob_sha(VENDOR / "docs/index.html")
+    client = managed_client(tmp_path)
+
+    response = client.get("/tools/session-converter/")
+
+    assert response.status_code == 200
+    assert '/manager-static/converter_bridge.js' in response.get_data(as_text=True)
+    assert response.headers["Cache-Control"] == "no-store"
+    assert git_blob_sha(VENDOR / "docs/index.html") == before
+    assert client.get("/tools/session-converter/favicon.svg").status_code == 200
+    assert client.get("/tools/session-converter/%2e%2e/README.md").status_code == 404
+
+
+def test_credential_import_route_requires_confirmation_and_hides_tokens(tmp_path):
+    client = managed_client(tmp_path)
+    document = codex_document("route@example.com", access="fixture-route-access")
+
+    denied = client.post("/api/manager/credentials/import", json={"documents": document})
+    response = client.post(
+        "/api/manager/credentials/import",
+        json={"confirmed": True, "documents": document},
+    )
+
+    assert denied.status_code == 400
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "ok": True,
+        "imported": 1,
+        "duplicates": 0,
+        "total": 1,
+    }
+    assert "fixture-route-access" not in response.get_data(as_text=True)
+
+
+def test_manager_import_has_its_own_five_mebibyte_request_limit(tmp_path):
+    client = managed_client(tmp_path)
+    medium = codex_document("medium@example.com", access="x" * (64 * 1024))
+
+    accepted = client.post(
+        "/api/manager/credentials/import",
+        json={"confirmed": True, "documents": medium},
+    )
+    oversized = b'{"confirmed":true,"documents":"' + b"x" * (5 * 1024 * 1024) + b'"}'
+    rejected = client.post(
+        "/api/manager/credentials/import",
+        data=oversized,
+        content_type="application/json",
+    )
+
+    assert accepted.status_code == 200
+    assert rejected.status_code == 413

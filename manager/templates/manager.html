@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>本地双项目控制台</title>
+  <style>
+    :root {
+      --ink: #12221d;
+      --ink-soft: #53635d;
+      --paper: #f4f7f3;
+      --surface: #ffffff;
+      --line: #d8e1dc;
+      --signal: #16845b;
+      --signal-soft: #e4f3eb;
+      --amber: #b75d12;
+      --amber-soft: #fff0dd;
+      --shadow: 0 18px 54px rgba(20, 52, 41, .09);
+      --radius: 22px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { min-width: 320px; background: var(--paper); }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(rgba(18, 34, 29, .035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(18, 34, 29, .035) 1px, transparent 1px),
+        var(--paper);
+      background-size: 32px 32px;
+      font: 16px/1.6 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+
+    a { color: inherit; }
+
+    .skip-link {
+      position: fixed;
+      left: 16px;
+      top: -64px;
+      z-index: 10;
+      padding: 10px 14px;
+      color: #fff;
+      background: var(--ink);
+      border-radius: 10px;
+    }
+
+    .skip-link:focus { top: 16px; }
+
+    .shell {
+      width: min(1100px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 54px 0 64px;
+    }
+
+    .masthead {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 28px;
+      align-items: start;
+      padding-bottom: 30px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .eyebrow,
+    .utility {
+      font: 600 12px/1.4 ui-monospace, "Cascadia Code", Consolas, monospace;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow { margin: 0 0 14px; color: var(--signal); }
+
+    h1 {
+      max-width: 720px;
+      margin: 0;
+      font-size: clamp(38px, 7vw, 72px);
+      line-height: .98;
+      letter-spacing: -.055em;
+      font-weight: 720;
+    }
+
+    .intro {
+      max-width: 660px;
+      margin: 22px 0 0;
+      color: var(--ink-soft);
+      font-size: 18px;
+    }
+
+    .local-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 44px;
+      padding: 0 16px;
+      border: 1px solid #bcd7ca;
+      border-radius: 999px;
+      color: #0d5c3d;
+      background: rgba(255,255,255,.72);
+      white-space: nowrap;
+    }
+
+    .local-badge::before {
+      width: 9px;
+      height: 9px;
+      content: "";
+      border-radius: 50%;
+      background: var(--signal);
+      box-shadow: 0 0 0 5px var(--signal-soft);
+    }
+
+    .modules {
+      position: relative;
+      display: grid;
+      gap: 18px;
+      margin-top: 34px;
+      padding-left: 42px;
+    }
+
+    .modules::before {
+      position: absolute;
+      inset: 22px auto 22px 12px;
+      width: 2px;
+      content: "";
+      background: linear-gradient(var(--signal), var(--amber));
+    }
+
+    .module {
+      position: relative;
+      display: grid;
+      grid-template-columns: 76px minmax(0, 1fr) auto;
+      gap: 22px;
+      align-items: center;
+      min-height: 210px;
+      padding: 28px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255,255,255,.91);
+      box-shadow: var(--shadow);
+    }
+
+    .module::before {
+      position: absolute;
+      left: -37px;
+      width: 12px;
+      height: 12px;
+      content: "";
+      border: 4px solid var(--paper);
+      border-radius: 50%;
+      background: var(--signal);
+      box-shadow: 0 0 0 2px var(--signal);
+    }
+
+    .module.converter::before { background: var(--amber); box-shadow: 0 0 0 2px var(--amber); }
+
+    .module-mark {
+      display: grid;
+      place-items: center;
+      width: 76px;
+      height: 76px;
+      border-radius: 18px;
+      color: var(--signal);
+      background: var(--signal-soft);
+      font: 700 18px/1 ui-monospace, "Cascadia Code", Consolas, monospace;
+    }
+
+    .converter .module-mark { color: var(--amber); background: var(--amber-soft); }
+
+    .module h2 {
+      margin: 0;
+      font-size: clamp(23px, 3vw, 32px);
+      line-height: 1.15;
+      letter-spacing: -.025em;
+    }
+
+    .module p { max-width: 590px; margin: 10px 0 0; color: var(--ink-soft); }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+      margin-top: 18px;
+      color: var(--ink-soft);
+      font-size: 13px;
+    }
+
+    .meta code {
+      color: var(--ink);
+      font: 600 12px/1.4 ui-monospace, "Cascadia Code", Consolas, monospace;
+    }
+
+    .action {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 144px;
+      min-height: 48px;
+      padding: 0 20px;
+      border-radius: 12px;
+      color: #fff;
+      background: var(--ink);
+      text-decoration: none;
+      font-weight: 650;
+      transition: transform 180ms ease, background-color 180ms ease;
+    }
+
+    .action:hover { background: #244139; transform: translateY(-2px); }
+    .converter .action { background: #8e470e; }
+    .converter .action:hover { background: #713707; }
+
+    .action:focus-visible,
+    .skip-link:focus-visible {
+      outline: 3px solid #2d76d2;
+      outline-offset: 4px;
+    }
+
+    .footnote {
+      display: flex;
+      justify-content: space-between;
+      gap: 24px;
+      margin-top: 24px;
+      padding: 18px 2px 0;
+      border-top: 1px solid var(--line);
+      color: var(--ink-soft);
+      font-size: 14px;
+    }
+
+    .footnote p { margin: 0; }
+    #status-note { text-align: right; }
+
+    @media (max-width: 720px) {
+      .shell { width: min(100% - 24px, 620px); padding-top: 30px; }
+      .masthead { grid-template-columns: 1fr; }
+      .local-badge { justify-self: start; }
+      .modules { padding-left: 24px; }
+      .modules::before { left: 5px; }
+      .module { grid-template-columns: 60px minmax(0, 1fr); padding: 22px; }
+      .module::before { left: -25px; }
+      .module-mark { width: 60px; height: 60px; border-radius: 15px; }
+      .action { grid-column: 1 / -1; width: 100%; }
+      .footnote { display: block; }
+      #status-note { margin-top: 8px; text-align: left; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+  <main class="shell" id="main">
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">Unified local manager / 本机统一入口</p>
+        <h1>两套工具，<br>一条本地线路。</h1>
+        <p class="intro">接码与 OAuth 继续独立运行，Session 转换器保持原始快照。这里仅提供统一入口、版本状态和明确确认后的本机保存。</p>
+      </div>
+      <div class="local-badge utility" aria-label="服务仅限本机访问">127.0.0.1 · Local only</div>
+    </header>
+
+    <section class="modules" aria-label="本机工具">
+      <article class="module" data-project-key="receiver">
+        <div class="module-mark" aria-hidden="true">RX</div>
+        <div>
+          <h2>接码与 OAuth 管理</h2>
+          <p>管理 HeroSMS 邮箱素材、Codex 登录流程、凭证状态与本机任务。</p>
+          <div class="meta">
+            <span>项目 <code>codex-auto-sms-receiver</code></span>
+            <span>固定版本 <code data-current-sha>读取中…</code></span>
+          </div>
+        </div>
+        <a class="action" href="/">打开接码工作台</a>
+      </article>
+
+      <article class="module converter" data-project-key="converter">
+        <div class="module-mark" aria-hidden="true">CV</div>
+        <div>
+          <h2>Session / Token 格式转换</h2>
+          <p>使用上游纯前端工具在浏览器内转换；只有点击并确认“保存到本地凭证库”后才会落盘。</p>
+          <div class="meta">
+            <span>项目 <code>GPTSession2CPAandSub2API</code></span>
+            <span>固定版本 <code data-current-sha>读取中…</code></span>
+          </div>
+        </div>
+        <a class="action" href="/tools/session-converter/">打开格式转换器</a>
+      </article>
+    </section>
+
+    <footer class="footnote">
+      <p>配置、凭证和日志不会在两个上游项目之间自动共享。</p>
+      <p id="status-note" role="status" aria-live="polite">正在读取本机状态…</p>
+    </footer>
+  </main>
+  <script>
+    (() => {
+      const note = document.getElementById("status-note");
+      fetch("/api/manager/status", { credentials: "same-origin" })
+        .then((response) => {
+          if (!response.ok) throw new Error("status unavailable");
+          return response.json();
+        })
+        .then((status) => {
+          for (const project of status.projects || []) {
+            const card = document.querySelector(`[data-project-key="${project.key}"]`);
+            const value = card && card.querySelector("[data-current-sha]");
+            if (value) value.textContent = String(project.current_sha || "未知").slice(0, 10);
+          }
+          note.textContent = `本机服务正常 · 已归档 ${status.credential_count || 0} 个凭证`;
+        })
+        .catch(() => { note.textContent = "本机状态暂时无法读取，请刷新页面重试。"; });
+    })();
+  </script>
+</body>
+</html>
