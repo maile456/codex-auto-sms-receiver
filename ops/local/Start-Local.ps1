@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 
 $script:ProjectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 $script:PythonPath = Join-Path $script:ProjectRoot ".venv\Scripts\python.exe"
-$script:AppPath = Join-Path $script:ProjectRoot "app.py"
+$script:AppPath = Join-Path $script:ProjectRoot "manager_app.py"
 $script:EnvPath = Join-Path $script:ProjectRoot ".env"
 $script:DataDirectory = Join-Path $script:ProjectRoot "data"
 $script:LogDirectory = Join-Path $script:ProjectRoot "logs"
@@ -16,7 +16,7 @@ $script:PidPath = Join-Path $script:DataDirectory "server.pid"
 $script:StdoutPath = Join-Path $script:LogDirectory "server.stdout.log"
 $script:StderrPath = Join-Path $script:LogDirectory "server.stderr.log"
 $script:HealthUrl = "http://127.0.0.1:5015/health"
-$script:WebUrl = "http://127.0.0.1:5015"
+$script:WebUrl = "http://127.0.0.1:5015/manager"
 
 function Get-CandidateProcess {
     param([int]$CandidateId)

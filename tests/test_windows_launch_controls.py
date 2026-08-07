@@ -17,6 +17,8 @@ START_SCRIPT = ROOT / "ops" / "local" / "Start-Local.ps1"
 STOP_SCRIPT = ROOT / "ops" / "local" / "Stop-Local.ps1"
 PID_PATH = ROOT / "data" / "server.pid"
 HEALTH_URL = "http://127.0.0.1:5015/health"
+MANAGER_URL = "http://127.0.0.1:5015/manager"
+MANAGER_ENTRY = ROOT / "manager_app.py"
 RUN_INTEGRATION = (
     sys.platform == "win32"
     and os.environ.get("RUN_LOCAL_CONTROL_INTEGRATION") == "1"
@@ -59,12 +61,36 @@ def _run_button(
     )
 
 
-def _health_is_available() -> bool:
+def _url_is_available(url: str) -> bool:
     try:
-        with urllib.request.urlopen(HEALTH_URL, timeout=2) as response:
+        with urllib.request.urlopen(url, timeout=2) as response:
             return response.status == 200
     except (OSError, urllib.error.URLError):
         return False
+
+
+def _health_is_available() -> bool:
+    return _url_is_available(HEALTH_URL)
+
+
+def _process_command_line(process_id: int) -> str:
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            f"(Get-CimInstance Win32_Process -Filter 'ProcessId = {process_id}').CommandLine",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, _details(result)
+    return result.stdout.strip()
 
 
 def _details(result: subprocess.CompletedProcess[str]) -> str:
@@ -103,6 +129,8 @@ def test_start_is_idempotent_and_stop_is_repeatable():
         assert first.returncode == 0, _details(first)
         assert _health_is_available()
         first_process_id = int(PID_PATH.read_text(encoding="utf-8").strip())
+        assert _url_is_available(MANAGER_URL)
+        assert str(MANAGER_ENTRY).casefold() in _process_command_line(first_process_id).casefold()
 
         second = _run_control(START_SCRIPT, "-NoBrowser")
         assert second.returncode == 0, _details(second)

@@ -730,7 +730,7 @@ Replace their single expected application path with `manager_app.py`; keep the e
 Restore `README.md` exactly by removing the previously added `### Windows 双击启动与关闭` section (the nine added lines between the browser URL and the WebUI local-only warning) with `apply_patch`, then verify:
 
 ```powershell
-$expected = git show bd661ff:README.md | git hash-object --stdin
+$expected = git rev-parse bd661ff:README.md
 $actual = git hash-object README.md
 if ($actual -ne $expected) { throw "README.md 未恢复到上游快照" }
 ```

@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 
 $script:ProjectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 $script:PythonPath = Join-Path $script:ProjectRoot ".venv\Scripts\python.exe"
-$script:AppPath = Join-Path $script:ProjectRoot "app.py"
+$script:AppPath = Join-Path $script:ProjectRoot "manager_app.py"
 $script:PidPath = Join-Path $script:ProjectRoot "data\server.pid"
 $script:HealthUrl = "http://127.0.0.1:5015/health"
 
