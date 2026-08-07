@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from manager.credential_import import CredentialImportError, import_codex_documents
+from manager.upstream_sync import RemoteCommit
 from manager_app import create_managed_app
 from src.settings import Settings
 
@@ -58,8 +59,29 @@ def settings_for(path: Path) -> Settings:
     )
 
 
-def managed_client(path: Path):
-    app = create_managed_app(settings_for(path), codex_manager=object())
+class StaticGitHubClient:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
+    def latest_commit(self, repository: str, branch: str) -> RemoteCommit:
+        self.calls.append((repository, branch))
+        commits = {
+            "maile456/codex-auto-sms-receiver": "269bf3cd088b075f164ad2fe8e674b8b72a9fd26",
+            "gtxx3600/GPTSession2CPAandSub2API": "a097eb155bb7bdf6cbbc26f1e4e75e120ab3163c",
+        }
+        return RemoteCommit(
+            sha=commits[repository],
+            title="fixture current commit",
+            committed_at="2026-08-08T00:00:00Z",
+        )
+
+
+def managed_client(path: Path, github_client=None):
+    app = create_managed_app(
+        settings_for(path),
+        codex_manager=object(),
+        manager_github_client=github_client or StaticGitHubClient(),
+    )
     app.config["TESTING"] = True
     return app.test_client()
 
@@ -192,6 +214,26 @@ def test_manager_status_exposes_pins_without_credentials(tmp_path):
         "converter": "a097eb155bb7bdf6cbbc26f1e4e75e120ab3163c",
     }
     assert "fixture-refresh-not-a-real-token" not in response.get_data(as_text=True)
+
+
+def test_manager_status_checks_each_upstream_once_then_uses_cache(tmp_path):
+    github = StaticGitHubClient()
+    client = managed_client(tmp_path, github)
+
+    first = client.get("/api/manager/status").get_json()
+    second = client.get("/api/manager/status").get_json()
+
+    assert len(github.calls) == 2
+    assert first["projects"] == second["projects"]
+    assert all(project["update_available"] is False for project in first["projects"])
+    assert all(project["latest_sha"] == project["current_sha"] for project in first["projects"])
+
+
+def test_manager_page_points_to_read_only_and_confirmed_local_update_buttons(tmp_path):
+    page = managed_client(tmp_path).get("/manager").get_data(as_text=True)
+    assert "检查更新.cmd" in page
+    assert "更新两个项目.cmd" in page
+    assert "网页不会直接替换源码" in page
 
 
 def test_converter_route_injects_bridge_without_modifying_vendor(tmp_path):

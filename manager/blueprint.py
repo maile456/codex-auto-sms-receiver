@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 import re
+import threading
+import time
 from pathlib import Path
 
 from flask import Blueprint, Response, jsonify, render_template, request, send_from_directory
@@ -9,13 +10,14 @@ from flask import Blueprint, Response, jsonify, render_template, request, send_f
 from src.settings import Settings
 
 from .credential_import import CredentialImportError, import_codex_documents
+from .upstream_sync import GitHubClient, SyncError, check_updates, load_lock
 
 
 MAX_MANAGER_IMPORT_BYTES = 5 * 1024 * 1024
 BRIDGE_TAG = '<script src="/manager-static/converter_bridge.js"></script>'
 
 
-def create_manager_blueprint(settings: Settings) -> Blueprint:
+def create_manager_blueprint(settings: Settings, *, github_client=None) -> Blueprint:
     blueprint = Blueprint(
         "manager",
         __name__,
@@ -29,6 +31,13 @@ def create_manager_blueprint(settings: Settings) -> Blueprint:
     ).resolve()
     lock_path = project_root / "manager" / "upstreams.lock.json"
     credential_dir = settings.data_dir / "codex_accounts"
+    update_client = github_client or GitHubClient()
+    update_cache_lock = threading.Lock()
+    update_cache: dict[str, object] = {
+        "key": None,
+        "expires_at": 0.0,
+        "projects": (),
+    }
 
     @blueprint.get("/manager")
     def manager_home():
@@ -37,19 +46,17 @@ def create_manager_blueprint(settings: Settings) -> Blueprint:
     @blueprint.get("/api/manager/status")
     def manager_status():
         try:
-            lock = json.loads(lock_path.read_text(encoding="utf-8"))
-            projects = [
-                {
-                    "key": row["key"],
-                    "repository": row["repository"],
-                    "current_sha": row["commit"],
-                    "latest_sha": None,
-                    "update_available": None,
-                }
-                for row in lock["upstreams"]
-            ]
-        except (OSError, KeyError, TypeError, ValueError):
+            lock = load_lock(lock_path)
+        except SyncError:
             return jsonify({"ok": False, "error": "上游锁文件不可用"}), 500
+        cache_key = tuple((spec.key, spec.commit) for spec in lock.upstreams)
+        now = time.monotonic()
+        with update_cache_lock:
+            if update_cache["key"] != cache_key or now >= float(update_cache["expires_at"]):
+                update_cache["projects"] = check_updates(lock, update_client)
+                update_cache["key"] = cache_key
+                update_cache["expires_at"] = now + 600
+            projects = [status.as_dict() for status in update_cache["projects"]]
         credential_count = 0
         if credential_dir.is_dir():
             credential_count = sum(1 for path in credential_dir.glob("*.json") if path.is_file())

@@ -272,6 +272,7 @@
           <div class="meta">
             <span>项目 <code>codex-auto-sms-receiver</code></span>
             <span>固定版本 <code data-current-sha>读取中…</code></span>
+            <span data-update-state>正在检查 GitHub…</span>
           </div>
         </div>
         <a class="action" href="/">打开接码工作台</a>
@@ -285,6 +286,7 @@
           <div class="meta">
             <span>项目 <code>GPTSession2CPAandSub2API</code></span>
             <span>固定版本 <code data-current-sha>读取中…</code></span>
+            <span data-update-state>正在检查 GitHub…</span>
           </div>
         </div>
         <a class="action" href="/tools/session-converter/">打开格式转换器</a>
@@ -292,7 +294,7 @@
     </section>
 
     <footer class="footnote">
-      <p>配置、凭证和日志不会在两个上游项目之间自动共享。</p>
+      <p>配置、凭证和日志不会自动共享。用 <strong>检查更新.cmd</strong> 只读检查；用 <strong>更新两个项目.cmd</strong> 预览并确认更新。网页不会直接替换源码。</p>
       <p id="status-note" role="status" aria-live="polite">正在读取本机状态…</p>
     </footer>
   </main>
@@ -309,6 +311,13 @@
             const card = document.querySelector(`[data-project-key="${project.key}"]`);
             const value = card && card.querySelector("[data-current-sha]");
             if (value) value.textContent = String(project.current_sha || "未知").slice(0, 10);
+            const updateState = card && card.querySelector("[data-update-state]");
+            if (updateState) {
+              if (project.update_available === true) updateState.textContent = "有更新";
+              else if (project.update_available === false) updateState.textContent = "已是最新";
+              else updateState.textContent = "无法检查";
+              if (project.title) updateState.title = project.title;
+            }
           }
           note.textContent = `本机服务正常 · 已归档 ${status.credential_count || 0} 个凭证`;
         })

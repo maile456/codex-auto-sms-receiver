@@ -6,9 +6,16 @@ from src.settings import Settings
 from src.webapp import create_app as create_upstream_app
 
 
-def create_managed_app(settings: Settings, **upstream_kwargs):
+def create_managed_app(
+    settings: Settings,
+    *,
+    manager_github_client=None,
+    **upstream_kwargs,
+):
     flask_app = create_upstream_app(settings, **upstream_kwargs)
-    flask_app.register_blueprint(create_manager_blueprint(settings))
+    flask_app.register_blueprint(
+        create_manager_blueprint(settings, github_client=manager_github_client)
+    )
     return flask_app
 
 
