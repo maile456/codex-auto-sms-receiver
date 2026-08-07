@@ -14,6 +14,10 @@
   saveButton.className = "secondary-button";
   saveButton.type = "button";
   saveButton.textContent = "保存到本地凭证库";
+  saveButton.style.minHeight = "44px";
+  saveButton.style.padding = "10px 16px";
+  saveButton.style.cursor = "pointer";
+  saveButton.style.touchAction = "manipulation";
   saveButton.setAttribute(
     "title",
     "只有在确认后，当前 Codex 格式结果才会保存到本机 data/codex_accounts"

@@ -27,6 +27,7 @@ function element(tagName = "div") {
     disabled: false,
     className: "",
     id: "",
+    style: {},
     setAttribute(name, value) { this.attributes.set(name, String(value)); },
     getAttribute(name) { return this.attributes.get(name) ?? null; },
     addEventListener(name, listener) { this.listeners.set(name, listener); },
@@ -96,6 +97,7 @@ function harness({ outputValue = JSON.stringify(codexDocument), confirmed = true
 async function testSuccessfulConfirmedSave() {
   const state = harness();
   assert.ok(state.saveButton, "bridge installs a save button");
+  assert.equal(state.saveButton.style.minHeight, "44px");
 
   await state.saveButton.click();
 
