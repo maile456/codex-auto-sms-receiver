@@ -82,7 +82,20 @@ def test_git_blob_sha_matches_github_blob_algorithm():
 
 
 @pytest.mark.parametrize(
-    "value", ["../escape", "/absolute", "C:/drive", "a/../../b", "a\\b", "a//b"]
+    "value",
+    [
+        "../escape",
+        "/absolute",
+        "C:/drive",
+        "a/../../b",
+        "a\\b",
+        "a//b",
+        "CON",
+        "dir/NUL.txt",
+        "trailing.",
+        "space ",
+        "control\x01name",
+    ],
 )
 def test_safe_repo_path_rejects_unsafe_names(value):
     with pytest.raises(SyncError):

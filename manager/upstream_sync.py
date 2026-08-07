@@ -23,6 +23,14 @@ from typing import Any
 
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+WINDOWS_DEVICE_NAMES = {
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
 GITHUB_JSON_LIMIT = 2 * 1024 * 1024
 ARCHIVE_LIMIT = 100 * 1024 * 1024
 EXTRACTED_LIMIT = 512 * 1024 * 1024
@@ -231,6 +239,14 @@ def safe_repo_path(value: str) -> PurePosixPath:
     result = PurePosixPath(value)
     if result.is_absolute() or any(part in {"", ".", ".."} for part in result.parts):
         raise SyncError(f"不安全的仓库路径: {value}")
+    for part in result.parts:
+        device_name = part.split(".", 1)[0].casefold()
+        if (
+            part.endswith((".", " "))
+            or any(ord(character) < 32 for character in part)
+            or device_name in WINDOWS_DEVICE_NAMES
+        ):
+            raise SyncError(f"Windows 不支持的仓库路径: {value}")
     return result
 
 
