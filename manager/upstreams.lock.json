@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "upstreams": [
+    {
+      "key": "receiver",
+      "repository": "maile456/codex-auto-sms-receiver",
+      "branch": "main",
+      "commit": "269bf3cd088b075f164ad2fe8e674b8b72a9fd26",
+      "target": ".",
+      "mode": "overlay",
+      "files": []
+    },
+    {
+      "key": "converter",
+      "repository": "gtxx3600/GPTSession2CPAandSub2API",
+      "branch": "main",
+      "commit": "a097eb155bb7bdf6cbbc26f1e4e75e120ab3163c",
+      "target": "vendor/GPTSession2CPAandSub2API",
+      "mode": "replace",
+      "files": []
+    }
+  ],
+  "protected_prefixes": [
+    ".git/",
+    ".env",
+    ".venv/",
+    "data/",
+    "logs/",
+    "manager/",
+    "manager_app.py",
+    "ops/",
+    "docs/superpowers/",
+    "tests/test_unified_manager.py",
+    "tests/test_upstream_sync.py",
+    "tests/test_windows_launch_controls.py",
+    "tests/test_windows_upstream_controls.py",
+    "tests/manager-bridge.test.js",
+    "启动.cmd",
+    "关闭.cmd",
+    "检查更新.cmd",
+    "更新两个项目.cmd",
+    "LOCAL-DEPLOYMENT.md"
+  ]
+}
