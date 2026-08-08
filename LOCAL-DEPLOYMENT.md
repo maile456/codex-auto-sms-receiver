@@ -26,6 +26,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\local\Start-Local.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ops\local\Stop-Local.ps1
 ```
 
+## 智能接码熔断
+
+通过 `启动.cmd` 或 `ops/local/Start-Local.ps1` 启动时，统一管理器会启用本地智能接码覆盖层：OpenAI 返回风控拒绝或手机号接口限流时立即停止当前账号；号码已使用、短信收码超时和验证码被拒最多换号一次；HeroSMS 无号码、余额不足或 API Key 错误时立即停止。现有“最大换号次数”仍是绝对总上限，智能规则可以更早停止，但不能被调大参数绕过。
+
+直接运行 `python app.py` 不启用该覆盖层。覆盖层只位于受保护的 `manager/` 集成层，不修改 `src/` 或 `vendor/` 上游文件，也不会自动调整国家、最低价、最高价或指定价格档。
+
+上游更新后会运行 Python 测试验证 `core.codex_oauth` 兼容性。如果上游接口变化导致智能覆盖无法安全安装，更新测试必须失败，现有更新脚本会恢复旧文件、依赖和服务。
+
 ## 本机入口
 
 - 统一管理：<http://127.0.0.1:5015/manager>
