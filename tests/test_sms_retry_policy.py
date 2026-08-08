@@ -32,6 +32,12 @@ from manager.sms_retry_policy import (
             "phone_used_or_max",
             SmsFailure.NUMBER_IN_USE,
         ),
+        (
+            "phone_number_in_use used too many times",
+            429,
+            "phone_used_or_max",
+            SmsFailure.PHONE_RATE_LIMITED,
+        ),
         ("", 400, "invalid_phone", SmsFailure.NUMBER_REJECTED),
         ("", 503, "server_error", SmsFailure.TRANSIENT_SERVER),
         ("", 204, "", None),
@@ -52,6 +58,9 @@ def test_classify_send_failure(
         ("Hero-SMS NO_NUMBERS: Numbers Not Found", SmsFailure.NO_NUMBERS),
         ("Hero-SMS NO_BALANCE", SmsFailure.NO_BALANCE),
         ("Hero-SMS BAD_KEY", SmsFailure.BAD_KEY),
+        ("Hero-SMS INVALID_KEY", SmsFailure.BAD_KEY),
+        ("Hero-SMS WRONG_KEY", SmsFailure.BAD_KEY),
+        ("Hero-SMS API key is empty", SmsFailure.BAD_KEY),
         ("Hero-SMS temporary provider failure", SmsFailure.UNKNOWN_SEND),
     ],
 )

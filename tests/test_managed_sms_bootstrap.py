@@ -1,13 +1,38 @@
 from __future__ import annotations
 
+import logging
+import multiprocessing
+from pathlib import Path
 import runpy
 from types import SimpleNamespace
 
 import pytest
 
 from manager.sms_bootstrap import install_managed_sms_runtime
+from manager.sms_runtime_overlay import install_codex_sms_overlay
 from src import artifact_store, codex_worker, upstream_bridge
 from src.codex_service import CodexJobManager
+from src.mailbox_store import MailboxStore
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _spawn_runtime_probe(result_queue, root: str) -> None:
+    runpy.run_path(str(Path(root) / "manager_app.py"), run_name="__mp_main__")
+    from src import codex_worker as spawned_worker
+    from src import upstream_bridge as spawned_bridge
+
+    result_queue.put(
+        {
+            "same_run": (
+                spawned_worker.run_codex_only
+                is spawned_bridge.run_codex_only
+            ),
+            "run_module": spawned_worker.run_codex_only.__module__,
+            "safe_result_module": spawned_worker._safe_result.__module__,
+        }
+    )
 
 
 def test_managed_runtime_wraps_worker_phone_jobs_and_restores(monkeypatch) -> None:
@@ -16,6 +41,7 @@ def test_managed_runtime_wraps_worker_phone_jobs_and_restores(monkeypatch) -> No
 
     def fake_original_run(settings, mailbox, *, reauth=False):
         events.append("run")
+        codex._manager_phone_verified = True
         return {"ok": True}
 
     monkeypatch.setattr(
@@ -43,7 +69,7 @@ def test_managed_runtime_wraps_worker_phone_jobs_and_restores(monkeypatch) -> No
     finally:
         installation.restore()
 
-    assert result == {"ok": True}
+    assert result == {"ok": True, "phone_verified": True}
     assert events == ["run", "restore"]
     assert upstream_bridge.run_codex_only is fake_original_run
     assert codex_worker.run_codex_only is fake_original_run
@@ -95,6 +121,48 @@ def test_phone_terminal_codes_are_not_scheduler_retryable() -> None:
         ) == ("rate_limited", True, 180)
     finally:
         installation.restore()
+
+
+def test_worker_and_scheduler_preserve_non_sensitive_verified_flag(tmp_path) -> None:
+    store = MailboxStore(tmp_path / "data")
+    store.import_text(
+        "generic_api",
+        "owner@example.com----https://mail.test/code",
+    )
+    settings = SimpleNamespace(
+        project_root=ROOT,
+        data_dir=tmp_path / "data",
+        log_dir=tmp_path / "logs",
+    )
+    manager = CodexJobManager(settings, store)
+    job = {
+        "email": "owner@example.com",
+        "log_path": str(tmp_path / "logs" / "missing.log"),
+        "reauth": False,
+    }
+    response = {
+        "result": {
+            "ok": True,
+            "status": "success",
+            "message": "done",
+            "file_path": str(tmp_path / "credential.json"),
+            "phone_verified": True,
+        }
+    }
+
+    installation = install_managed_sms_runtime()
+    try:
+        safe = codex_worker._safe_result(response["result"])
+        manager._handle_result_locked(job, {"result": safe}, {})
+    finally:
+        installation.restore()
+
+    account = store.list_accounts()[0]
+    assert safe["phone_verified"] is True
+    assert job["phone_verified"] is True
+    assert job["phone_number"] == ""
+    assert account["phone_verified"] is True
+    assert account["phone_number"] == ""
 
 
 @pytest.mark.parametrize(
@@ -154,6 +222,67 @@ def test_installation_is_idempotent() -> None:
         assert second is first
     finally:
         first.restore()
+
+
+def test_real_upstream_sms_poller_redacts_received_otp(
+    monkeypatch,
+    caplog,
+) -> None:
+    settings = SimpleNamespace(project_root=ROOT, data_dir=ROOT / "data")
+    codex_oauth = upstream_bridge._ensure_upstream_imports(settings)
+    provider = codex_oauth.sms_provider
+    caplog.set_level(logging.INFO, logger=provider.logger.name)
+    monkeypatch.setattr(
+        provider,
+        "_request_grizzly",
+        lambda http, params: "STATUS_OK:654321",
+    )
+
+    installation = install_managed_sms_runtime()
+    try:
+        code = provider.wait_for_sms_code("activation-safe-test", http=object())
+    finally:
+        installation.restore()
+
+    assert code == "654321"
+    assert "654321" not in caplog.text
+    assert "[REDACTED]" in caplog.text
+
+
+def test_checked_in_codex_oauth_accepts_and_restores_overlay() -> None:
+    settings = SimpleNamespace(project_root=ROOT, data_dir=ROOT / "data")
+    codex_oauth = upstream_bridge._ensure_upstream_imports(settings)
+    original = codex_oauth._do_phone_verification
+
+    patch = install_codex_sms_overlay(codex_oauth)
+    try:
+        assert codex_oauth._do_phone_verification is patch.patched
+    finally:
+        patch.restore()
+
+    assert codex_oauth._do_phone_verification is original
+
+
+def test_real_spawn_import_installs_worker_runtime_wrapper() -> None:
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_spawn_runtime_probe,
+        args=(result_queue, str(ROOT)),
+    )
+    process.start()
+    process.join(timeout=20)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+
+    assert process.exitcode == 0
+    result = result_queue.get(timeout=5)
+    assert result == {
+        "same_run": True,
+        "run_module": "manager.sms_bootstrap",
+        "safe_result_module": "manager.sms_bootstrap",
+    }
 
 
 def test_manager_entry_installs_runtime_when_spawn_imports(monkeypatch) -> None:

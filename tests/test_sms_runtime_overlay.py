@@ -262,6 +262,34 @@ def test_otp_rejection_retries_once_then_stops() -> None:
     assert lifecycle.cancelled == ["activation-1", "activation-2"]
 
 
+@pytest.mark.parametrize(
+    ("status", "body", "expected_code"),
+    [
+        (400, "invalid_request_error fraud_guard suspicious behavior", "fraud_guard"),
+        (429, "phone_number_in_use rate_limit_exceeded", "phone_rate_limited"),
+    ],
+)
+def test_validation_fraud_or_rate_limit_stops_without_replacement(
+    status: int,
+    body: str,
+    expected_code: str,
+) -> None:
+    module, lifecycle = fake_codex_module(
+        send=[(204, "")],
+        sms_codes=["111111"],
+        validate=[(status, body)],
+    )
+
+    with install_codex_sms_overlay(module):
+        with pytest.raises(SmartSmsStop) as caught:
+            module._do_phone_verification(object())
+
+    assert caught.value.code == expected_code
+    assert lifecycle.acquired == 1
+    assert lifecycle.cancelled == ["activation-1"]
+    assert lifecycle.sleeps == []
+
+
 def test_success_completes_without_cancel() -> None:
     module, lifecycle = fake_codex_module(
         send=[(204, "")],
@@ -275,6 +303,7 @@ def test_success_completes_without_cancel() -> None:
     assert lifecycle.statuses == [("activation-1", 1)]
     assert lifecycle.completed == ["activation-1"]
     assert lifecycle.cancelled == []
+    assert module._manager_phone_verified is True
     assert lifecycle.requests == [
         (
             "https://auth.openai.com/api/accounts/add-phone/send",

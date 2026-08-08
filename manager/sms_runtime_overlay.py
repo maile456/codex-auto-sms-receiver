@@ -174,7 +174,26 @@ def _managed_phone_verification(module: Any, session: Any) -> None:
                     {"code": sms_code},
                     referer="https://auth.openai.com/phone-verification",
                 )
-                if validate_response.status_code != 200:
+                validate_text = module._response_text(validate_response)
+                validate_upstream_reason = module._phone_failure_reason(
+                    validate_text,
+                    validate_response.status_code,
+                )
+                validate_failure = classify_send_failure(
+                    validate_text,
+                    validate_response.status_code,
+                    validate_upstream_reason,
+                )
+                if validate_response.status_code != 200 or validate_failure is not None:
+                    terminal_validation_failure = (
+                        validate_failure
+                        if validate_failure
+                        in {
+                            SmsFailure.FRAUD_GUARD,
+                            SmsFailure.PHONE_RATE_LIMITED,
+                        }
+                        else SmsFailure.OTP_REJECTED
+                    )
                     _cancel_without_masking(
                         provider,
                         activation_id,
@@ -184,7 +203,7 @@ def _managed_phone_verification(module: Any, session: Any) -> None:
                     activation_id = None
                     _retry_or_stop(
                         module,
-                        SmsFailure.OTP_REJECTED,
+                        terminal_validation_failure,
                         counters,
                         attempt,
                         max_attempts,
@@ -193,6 +212,7 @@ def _managed_phone_verification(module: Any, session: Any) -> None:
 
                 provider.complete(activation_id, http)
                 activation_id = None
+                setattr(module, "_manager_phone_verified", True)
                 module.logger.info("[Codex] 手机号验证通过")
                 return
 

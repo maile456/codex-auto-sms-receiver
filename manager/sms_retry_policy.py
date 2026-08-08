@@ -100,16 +100,6 @@ def classify_send_failure(
     body = f"{text} {upstream_reason}".casefold()
     if "fraud_guard" in body or "suspicious behavior" in body:
         return SmsFailure.FRAUD_GUARD
-    if any(
-        marker in body
-        for marker in (
-            "phone_number_in_use",
-            "phone number already in use",
-            "already used",
-            "phone_used_or_max",
-        )
-    ):
-        return SmsFailure.NUMBER_IN_USE
     if (
         status_code == 429
         or any(
@@ -124,6 +114,16 @@ def classify_send_failure(
         )
     ):
         return SmsFailure.PHONE_RATE_LIMITED
+    if any(
+        marker in body
+        for marker in (
+            "phone_number_in_use",
+            "phone number already in use",
+            "already used",
+            "phone_used_or_max",
+        )
+    ):
+        return SmsFailure.NUMBER_IN_USE
     if upstream_reason in {
         "invalid_phone",
         "delivery_refused",
@@ -143,7 +143,19 @@ def classify_provider_failure(message: str) -> SmsFailure:
         return SmsFailure.NO_NUMBERS
     if "no_balance" in value:
         return SmsFailure.NO_BALANCE
-    if "bad_key" in value or "bad key" in value:
+    if any(
+        marker in value
+        for marker in (
+            "bad_key",
+            "bad key",
+            "invalid_key",
+            "wrong_key",
+            "api key is empty",
+            "empty api key",
+            "missing api key",
+            "invalid api key",
+        )
+    ):
         return SmsFailure.BAD_KEY
     return SmsFailure.UNKNOWN_SEND
 
