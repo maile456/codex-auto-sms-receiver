@@ -8,7 +8,12 @@ import sys
 import threading
 from typing import Any
 
-from .sms_runtime_overlay import install_codex_sms_overlay
+from .sms_retry_policy import SmsFailure, classify_provider_failure
+from .sms_runtime_overlay import (
+    TerminalSmsProviderAbort,
+    install_codex_sms_overlay,
+    terminal_provider_abort_enabled,
+)
 
 
 _SMART_CODE = re.compile(r"\bsmart_sms_code=([a-z_]{1,64})\b", re.IGNORECASE)
@@ -23,11 +28,25 @@ _INSTALLATION: "ManagedSmsInstallation | None" = None
 class _OtpRedactionFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
-        redacted = _RECEIVED_OTP.sub(r"\1[REDACTED]", message)
+        redacted = _RECEIVED_OTP.sub(
+            "手机 OTP 收到 [REDACTED]",
+            message,
+        )
         if redacted != message:
             record.msg = redacted
             record.args = ()
         return True
+
+
+class _VerifiedWithoutPhoneNumber:
+    def __bool__(self) -> bool:
+        return True
+
+    def __str__(self) -> str:
+        return ""
+
+
+_VERIFIED_WITHOUT_PHONE = _VerifiedWithoutPhoneNumber()
 
 
 @dataclass
@@ -43,6 +62,12 @@ class ManagedSmsInstallation:
     artifact_module: Any
     original_status_parser: Any
     patched_status_parser: Any
+    artifact_store_class: type
+    original_phone_lookup: Any
+    patched_phone_lookup: Any
+    hero_adapter_class: type
+    original_hero_query: Any
+    patched_hero_query: Any
     worker_module: Any | None
     original_worker_run: Any | None
     original_worker_safe_result: Any | None
@@ -81,6 +106,15 @@ class ManagedSmsInstallation:
                 self.artifact_module._sms_rejection_status = (
                     self.original_status_parser
                 )
+            if (
+                self.artifact_store_class.phone_verification_for_account
+                is self.patched_phone_lookup
+            ):
+                self.artifact_store_class.phone_verification_for_account = (
+                    self.original_phone_lookup
+                )
+            if self.hero_adapter_class.query is self.patched_hero_query:
+                self.hero_adapter_class.query = self.original_hero_query
             if (
                 self.worker_module is not None
                 and self.patched_worker_safe_result is not None
@@ -133,7 +167,7 @@ def _smart_statistics_status(body: str) -> str | None:
 
 def install_managed_sms_runtime() -> ManagedSmsInstallation:
     global _INSTALLATION
-    from src import artifact_store, upstream_bridge
+    from src import artifact_store, hero_sms, upstream_bridge
     from src.codex_service import CodexJobManager
 
     with _INSTALL_LOCK:
@@ -144,15 +178,37 @@ def install_managed_sms_runtime() -> ManagedSmsInstallation:
         original_failure_info = CodexJobManager._failure_info
         original_handle_result = CodexJobManager._handle_result_locked
         original_status_parser = artifact_store._sms_rejection_status
+        original_phone_lookup = (
+            artifact_store.ArtifactStore.phone_verification_for_account
+        )
+        original_hero_query = hero_sms.HeroSmsAdapter.query
+        worker_was_loaded = "src.codex_worker" in sys.modules
+        worker_module = importlib.import_module("src.codex_worker")
+        worker_missing = [
+            name
+            for name in ("run_codex_only", "_safe_result")
+            if not callable(getattr(worker_module, name, None))
+        ]
+        if worker_missing:
+            raise RuntimeError(
+                "智能接码管理器不兼容，缺少 worker 接口: "
+                + ", ".join(worker_missing)
+            )
+        original_worker_run = (
+            worker_module.run_codex_only
+            if worker_was_loaded
+            else original_bridge_run
+        )
+        original_worker_safe_result = worker_module._safe_result
 
         def managed_run(settings, mailbox, *, reauth=False):
             patch = None
             codex_oauth = None
-            if not reauth:
-                codex_oauth = upstream_bridge._ensure_upstream_imports(settings)
-                setattr(codex_oauth, "_manager_phone_verified", False)
-                patch = install_codex_sms_overlay(codex_oauth)
             try:
+                if not reauth:
+                    codex_oauth = upstream_bridge._ensure_upstream_imports(settings)
+                    setattr(codex_oauth, "_manager_phone_verified", False)
+                    patch = install_codex_sms_overlay(codex_oauth)
                 result = original_bridge_run(
                     settings,
                     mailbox,
@@ -208,20 +264,48 @@ def install_managed_sms_runtime() -> ManagedSmsInstallation:
                 return smart
             return original_status_parser(body)
 
+        def managed_phone_lookup(store, account_id):
+            verified = original_phone_lookup(store, account_id)
+            if verified:
+                return verified
+            from src.mailbox_store import MailboxStore
+
+            account = MailboxStore(store.data_dir).get_secret(
+                account_id=str(account_id or "")
+            )
+            if (
+                account
+                and bool(account.get("phone_verified"))
+                and not str(account.get("phone_number") or "")
+            ):
+                return {
+                    "phone_number": _VERIFIED_WITHOUT_PHONE,
+                    "phone_verified_at": account.get("phone_verified_at"),
+                }
+            return verified
+
+        def managed_hero_query(adapter, *args, **kwargs):
+            try:
+                return original_hero_query(adapter, *args, **kwargs)
+            except Exception as exc:
+                failure = classify_provider_failure(str(exc))
+                if (
+                    terminal_provider_abort_enabled()
+                    and failure in {SmsFailure.BAD_KEY, SmsFailure.NO_BALANCE}
+                ):
+                    raise TerminalSmsProviderAbort(failure) from exc
+                raise
+
         upstream_bridge.run_codex_only = managed_run
         CodexJobManager._failure_info = staticmethod(managed_failure_info)
         CodexJobManager._handle_result_locked = managed_handle_result
         artifact_store._sms_rejection_status = managed_status_parser
-
-        worker_was_loaded = "src.codex_worker" in sys.modules
-        worker_module = importlib.import_module("src.codex_worker")
-        original_worker_run = (
-            worker_module.run_codex_only
-            if worker_was_loaded
-            else original_bridge_run
+        artifact_store.ArtifactStore.phone_verification_for_account = (
+            managed_phone_lookup
         )
+        hero_sms.HeroSmsAdapter.query = managed_hero_query
+
         worker_module.run_codex_only = managed_run
-        original_worker_safe_result = worker_module._safe_result
 
         def managed_worker_safe_result(result):
             safe = original_worker_safe_result(result)
@@ -247,6 +331,12 @@ def install_managed_sms_runtime() -> ManagedSmsInstallation:
             artifact_module=artifact_store,
             original_status_parser=original_status_parser,
             patched_status_parser=managed_status_parser,
+            artifact_store_class=artifact_store.ArtifactStore,
+            original_phone_lookup=original_phone_lookup,
+            patched_phone_lookup=managed_phone_lookup,
+            hero_adapter_class=hero_sms.HeroSmsAdapter,
+            original_hero_query=original_hero_query,
+            patched_hero_query=managed_hero_query,
             worker_module=worker_module,
             original_worker_run=original_worker_run,
             original_worker_safe_result=original_worker_safe_result,

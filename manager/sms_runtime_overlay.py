@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 import threading
 from typing import Any
@@ -16,12 +17,33 @@ from .sms_retry_policy import (
 
 _PATCH_ATTRIBUTE = "_manager_smart_sms_patch"
 _PATCH_LOCK = threading.RLock()
+_PROVIDER_ABORT_STATE = threading.local()
 
 
 class SmartSmsStop(RuntimeError):
     def __init__(self, code: str, message: str):
         self.code = str(code)
         super().__init__(f"[smart_sms:{self.code}] {message}")
+
+
+class TerminalSmsProviderAbort(BaseException):
+    def __init__(self, failure: SmsFailure):
+        self.failure = failure
+        super().__init__(failure.value)
+
+
+def terminal_provider_abort_enabled() -> bool:
+    return bool(getattr(_PROVIDER_ABORT_STATE, "enabled", False))
+
+
+@contextmanager
+def _terminal_provider_abort_scope():
+    previous = terminal_provider_abort_enabled()
+    _PROVIDER_ABORT_STATE.enabled = True
+    try:
+        yield
+    finally:
+        _PROVIDER_ABORT_STATE.enabled = previous
 
 
 @dataclass
@@ -119,7 +141,8 @@ def _managed_phone_verification(module: Any, session: Any) -> None:
         for attempt in range(1, max_attempts + 1):
             activation_id: str | None = None
             try:
-                activation_id, phone = provider.acquire_number(http)
+                with _terminal_provider_abort_scope():
+                    activation_id, phone = provider.acquire_number(http)
                 module.logger.info(
                     "[Codex] 手机号验证尝试 %s/%s provider=%s activation_id=%s",
                     attempt,
@@ -218,6 +241,14 @@ def _managed_phone_verification(module: Any, session: Any) -> None:
 
             except SmartSmsStop:
                 raise
+            except TerminalSmsProviderAbort as exc:
+                _cancel_without_masking(
+                    provider,
+                    activation_id,
+                    http,
+                    module.logger,
+                )
+                raise _stop_for_provider_failure(exc.failure)
             except provider.SmsNoNumbersError:
                 _cancel_without_masking(
                     provider,
@@ -354,5 +385,7 @@ def install_codex_sms_overlay(codex_oauth: Any) -> CodexSmsPatch:
 __all__ = [
     "CodexSmsPatch",
     "SmartSmsStop",
+    "TerminalSmsProviderAbort",
     "install_codex_sms_overlay",
+    "terminal_provider_abort_enabled",
 ]
