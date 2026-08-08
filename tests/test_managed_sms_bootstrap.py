@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 import json
 import logging
 import multiprocessing
 from pathlib import Path
 import runpy
 from types import SimpleNamespace
+import zipfile
 
 import pytest
 
@@ -24,18 +26,19 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class _HeroTerminalResponse:
-    def __init__(self, title: str):
+    def __init__(self, title: str, *, payload_field: str = "title"):
         self.status_code = 200
-        self.text = title
-        self._title = title
+        self._payload = {payload_field: title}
+        self.text = json.dumps(self._payload)
 
     def json(self):
-        return {"title": self._title}
+        return dict(self._payload)
 
 
 class _CountingHeroHttp:
-    def __init__(self, title: str):
+    def __init__(self, title: str, *, payload_field: str = "title"):
         self.title = title
+        self.payload_field = payload_field
         self.calls: list[dict] = []
         self.closed = 0
 
@@ -46,10 +49,43 @@ class _CountingHeroHttp:
                 for key, value in dict(params).items()
             }
         )
-        return _HeroTerminalResponse(self.title)
+        return _HeroTerminalResponse(
+            self.title,
+            payload_field=self.payload_field,
+        )
 
     def close(self) -> None:
         self.closed += 1
+
+
+class _HeroRequestStageResponse:
+    status_code = 200
+
+    def __init__(self, payload):
+        self._payload = payload
+        self.text = json.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+
+class _RequestStageHeroHttp:
+    def __init__(self, terminal_code: str):
+        self.terminal_code = terminal_code
+        self.calls: list[dict] = []
+
+    def get(self, url, params):
+        safe_params = {
+            key: "[SET]" if key == "api_key" else value
+            for key, value in dict(params).items()
+        }
+        self.calls.append(safe_params)
+        if str(params.get("action") or "").startswith("getPrices"):
+            return _HeroRequestStageResponse({})
+        return _HeroRequestStageResponse(self.terminal_code)
+
+    def close(self) -> None:
+        return None
 
 
 class _AccountApiManager:
@@ -222,7 +258,8 @@ def test_account_apis_preserve_verified_state_without_phone_number(tmp_path) -> 
     store = MailboxStore(data_dir)
     store.import_text(
         "generic_api",
-        "owner@example.com----https://mail.test/code",
+        "owner@example.com----https://mail.test/code\n"
+        "unverified@example.com----https://mail.test/unverified",
     )
     store.update_codex(
         "owner@example.com",
@@ -254,17 +291,57 @@ def test_account_apis_preserve_verified_state_without_phone_number(tmp_path) -> 
         app = create_managed_app(settings, codex_manager=_AccountApiManager())
         app.config["TESTING"] = True
         client = app.test_client()
-        account = client.get("/api/accounts").get_json()["accounts"][0]
+        accounts = client.get("/api/accounts").get_json()["accounts"]
+        account = next(row for row in accounts if row["email"] == "owner@example.com")
+        overview_accounts = client.get("/api/overview").get_json()["accounts"]
+        overview_account = next(
+            row for row in overview_accounts if row["email"] == "owner@example.com"
+        )
         inventory = client.get("/api/seller/inventory").get_json()
+        verified_export = client.post(
+            "/api/seller/export",
+            json={
+                "confirmed": True,
+                "count": 1,
+                "format": "original",
+                "export_state": "all",
+                "phone_state": "verified",
+            },
+        )
+        unverified_export = client.post(
+            "/api/seller/export",
+            json={
+                "confirmed": True,
+                "count": 1,
+                "format": "original",
+                "export_state": "all",
+                "phone_state": "unverified",
+            },
+        )
     finally:
         installation.restore()
 
     assert account["has_credential"] is True
     assert account["phone_verified"] is True
     assert account["phone_number"] == ""
-    assert inventory["accounts"][0]["phone_verified"] is True
+    assert overview_account["phone_verified"] is True
+    assert overview_account["phone_number"] == ""
+    inventory_account = next(
+        row for row in inventory["accounts"] if row["email"] == "owner@example.com"
+    )
+    assert inventory_account["phone_verified"] is True
     assert inventory["summary"]["phone_verified"] == 1
-    assert inventory["summary"]["phone_unverified"] == 0
+    assert inventory["summary"]["phone_unverified"] == 1
+    assert verified_export.status_code == 200
+    assert unverified_export.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(verified_export.data)) as archive:
+        verified_material = archive.read("generic_api.txt").decode("utf-8")
+    with zipfile.ZipFile(io.BytesIO(unverified_export.data)) as archive:
+        unverified_material = archive.read("generic_api.txt").decode("utf-8")
+    assert "owner@example.com" in verified_material
+    assert "unverified@example.com" not in verified_material
+    assert "unverified@example.com" in unverified_material
+    assert "owner@example.com" not in unverified_material
 
 
 @pytest.mark.parametrize(
@@ -336,6 +413,7 @@ def test_install_preflight_failure_leaves_runtime_unmodified(monkeypatch) -> Non
     original_phone_lookup = (
         artifact_store.ArtifactStore.phone_verification_for_account
     )
+    original_hero_request = hero_sms.HeroSmsAdapter.request
     original_hero_query = hero_sms.HeroSmsAdapter.query
     real_import = sms_bootstrap.importlib.import_module
 
@@ -361,6 +439,7 @@ def test_install_preflight_failure_leaves_runtime_unmodified(monkeypatch) -> Non
         artifact_store.ArtifactStore.phone_verification_for_account
         is original_phone_lookup
     )
+    assert hero_sms.HeroSmsAdapter.request is original_hero_request
     assert hero_sms.HeroSmsAdapter.query is original_hero_query
 
 
@@ -425,15 +504,111 @@ def test_checked_in_codex_oauth_accepts_and_restores_overlay() -> None:
 
 
 @pytest.mark.parametrize(
-    ("title", "expected_code"),
+    ("payload_field", "title", "expected_code"),
     [
-        ("BAD_KEY", "sms_bad_key"),
-        ("INVALID_KEY", "sms_bad_key"),
-        ("WRONG_KEY", "sms_bad_key"),
-        ("NO_BALANCE", "sms_no_balance"),
+        ("title", "BAD_KEY", "sms_bad_key"),
+        ("title", "INVALID_KEY", "sms_bad_key"),
+        ("title", "WRONG_KEY", "sms_bad_key"),
+        ("title", "NO_BALANCE", "sms_no_balance"),
+        ("result", "BAD_KEY", "sms_bad_key"),
+        ("result", "INVALID_KEY", "sms_bad_key"),
+        ("result", "WRONG_KEY", "sms_bad_key"),
+        ("result", "NO_BALANCE", "sms_no_balance"),
+        ("result", "NOT_ENOUGH_BALANCE", "sms_no_balance"),
     ],
 )
 def test_real_hero_coordinator_aborts_terminal_error_after_one_request(
+    monkeypatch,
+    payload_field: str,
+    title: str,
+    expected_code: str,
+) -> None:
+    settings = SimpleNamespace(project_root=ROOT, data_dir=ROOT / "data")
+    codex_oauth = upstream_bridge._ensure_upstream_imports(settings)
+    monkeypatch.setenv("HERO_SMS_API_KEY", "fixture-key")
+    monkeypatch.setenv("HERO_SMS_COUNTRIES", "4,6")
+    provider = codex_oauth.sms_provider
+    http = _CountingHeroHttp(title, payload_field=payload_field)
+    monkeypatch.setattr(provider, "_http", lambda: http)
+
+    installation = install_managed_sms_runtime()
+    hero_patch = install_hero_sms_patch(provider)
+    codex_patch = install_codex_sms_overlay(codex_oauth)
+    try:
+        with pytest.raises(SmartSmsStop) as caught:
+            codex_oauth._do_phone_verification(object())
+    finally:
+        codex_patch.restore()
+        hero_patch.restore()
+        installation.restore()
+
+    assert caught.value.code == expected_code
+    assert len(http.calls) == 1
+
+
+def test_real_hero_request_stage_terminal_error_aborts_first_number_request(
+    monkeypatch,
+) -> None:
+    settings = SimpleNamespace(project_root=ROOT, data_dir=ROOT / "data")
+    codex_oauth = upstream_bridge._ensure_upstream_imports(settings)
+    monkeypatch.setenv("HERO_SMS_API_KEY", "fixture-key")
+    monkeypatch.setenv("HERO_SMS_COUNTRIES", "4,6")
+    provider = codex_oauth.sms_provider
+    http = _RequestStageHeroHttp("BAD_KEY")
+    monkeypatch.setattr(provider, "_http", lambda: http)
+
+    installation = install_managed_sms_runtime()
+    hero_patch = install_hero_sms_patch(provider)
+    codex_patch = install_codex_sms_overlay(codex_oauth)
+    try:
+        with pytest.raises(SmartSmsStop) as caught:
+            codex_oauth._do_phone_verification(object())
+    finally:
+        codex_patch.restore()
+        hero_patch.restore()
+        installation.restore()
+
+    number_actions = [
+        call["action"]
+        for call in http.calls
+        if str(call.get("action") or "").startswith("getNumber")
+    ]
+    assert caught.value.code == "sms_bad_key"
+    assert number_actions == ["getNumber"]
+
+
+def test_hero_request_outside_acquire_context_keeps_normal_provider_error(
+    monkeypatch,
+) -> None:
+    settings = SimpleNamespace(project_root=ROOT, data_dir=ROOT / "data")
+    codex_oauth = upstream_bridge._ensure_upstream_imports(settings)
+    monkeypatch.setenv("HERO_SMS_API_KEY", "fixture-key")
+    provider = codex_oauth.sms_provider
+    http = _CountingHeroHttp("BAD_KEY", payload_field="result")
+
+    installation = install_managed_sms_runtime()
+    hero_patch = install_hero_sms_patch(provider)
+    try:
+        with pytest.raises(provider.SmsProviderError):
+            hero_patch.coordinator.adapter.request(
+                http,
+                {"action": "getPrices", "service": "wa", "country": "4"},
+            )
+    finally:
+        hero_patch.restore()
+        installation.restore()
+
+    assert len(http.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("title", "expected_code"),
+    [
+        ("NO_NUMBERS", "sms_no_numbers"),
+        ("WRONG_MAX_PRICE", "phone_unknown_send"),
+    ],
+)
+def test_real_hero_coordinator_continues_scanning_nonterminal_errors(
     monkeypatch,
     title: str,
     expected_code: str,
@@ -458,7 +633,7 @@ def test_real_hero_coordinator_aborts_terminal_error_after_one_request(
         installation.restore()
 
     assert caught.value.code == expected_code
-    assert len(http.calls) == 1
+    assert len(http.calls) > 1
 
 
 def test_real_spawn_import_installs_worker_runtime_wrapper() -> None:

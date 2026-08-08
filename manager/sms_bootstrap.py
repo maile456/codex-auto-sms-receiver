@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import importlib
 import logging
@@ -66,6 +67,8 @@ class ManagedSmsInstallation:
     original_phone_lookup: Any
     patched_phone_lookup: Any
     hero_adapter_class: type
+    original_hero_request: Any
+    patched_hero_request: Any
     original_hero_query: Any
     patched_hero_query: Any
     worker_module: Any | None
@@ -113,6 +116,8 @@ class ManagedSmsInstallation:
                 self.artifact_store_class.phone_verification_for_account = (
                     self.original_phone_lookup
                 )
+            if self.hero_adapter_class.request is self.patched_hero_request:
+                self.hero_adapter_class.request = self.original_hero_request
             if self.hero_adapter_class.query is self.patched_hero_query:
                 self.hero_adapter_class.query = self.original_hero_query
             if (
@@ -165,6 +170,15 @@ def _smart_statistics_status(body: str) -> str | None:
     }.get(matched.group(1).casefold(), "send_rejected")
 
 
+def _terminal_failure_from_provider_result(result: Any) -> SmsFailure | None:
+    if not isinstance(result, Mapping):
+        return None
+    failure = classify_provider_failure(str(result.get("result") or ""))
+    if failure in {SmsFailure.BAD_KEY, SmsFailure.NO_BALANCE}:
+        return failure
+    return None
+
+
 def install_managed_sms_runtime() -> ManagedSmsInstallation:
     global _INSTALLATION
     from src import artifact_store, hero_sms, upstream_bridge
@@ -181,6 +195,7 @@ def install_managed_sms_runtime() -> ManagedSmsInstallation:
         original_phone_lookup = (
             artifact_store.ArtifactStore.phone_verification_for_account
         )
+        original_hero_request = hero_sms.HeroSmsAdapter.request
         original_hero_query = hero_sms.HeroSmsAdapter.query
         worker_was_loaded = "src.codex_worker" in sys.modules
         worker_module = importlib.import_module("src.codex_worker")
@@ -286,7 +301,23 @@ def install_managed_sms_runtime() -> ManagedSmsInstallation:
 
         def managed_hero_query(adapter, *args, **kwargs):
             try:
-                return original_hero_query(adapter, *args, **kwargs)
+                result = original_hero_query(adapter, *args, **kwargs)
+            except Exception as exc:
+                failure = classify_provider_failure(str(exc))
+                if (
+                    terminal_provider_abort_enabled()
+                    and failure in {SmsFailure.BAD_KEY, SmsFailure.NO_BALANCE}
+                ):
+                    raise TerminalSmsProviderAbort(failure) from exc
+                raise
+            failure = _terminal_failure_from_provider_result(result)
+            if terminal_provider_abort_enabled() and failure is not None:
+                raise TerminalSmsProviderAbort(failure)
+            return result
+
+        def managed_hero_request(adapter, *args, **kwargs):
+            try:
+                return original_hero_request(adapter, *args, **kwargs)
             except Exception as exc:
                 failure = classify_provider_failure(str(exc))
                 if (
@@ -303,6 +334,7 @@ def install_managed_sms_runtime() -> ManagedSmsInstallation:
         artifact_store.ArtifactStore.phone_verification_for_account = (
             managed_phone_lookup
         )
+        hero_sms.HeroSmsAdapter.request = managed_hero_request
         hero_sms.HeroSmsAdapter.query = managed_hero_query
 
         worker_module.run_codex_only = managed_run
@@ -335,6 +367,8 @@ def install_managed_sms_runtime() -> ManagedSmsInstallation:
             original_phone_lookup=original_phone_lookup,
             patched_phone_lookup=managed_phone_lookup,
             hero_adapter_class=hero_sms.HeroSmsAdapter,
+            original_hero_request=original_hero_request,
+            patched_hero_request=managed_hero_request,
             original_hero_query=original_hero_query,
             patched_hero_query=managed_hero_query,
             worker_module=worker_module,

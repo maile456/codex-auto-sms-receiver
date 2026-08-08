@@ -57,6 +57,7 @@ def test_classify_send_failure(
     [
         ("Hero-SMS NO_NUMBERS: Numbers Not Found", SmsFailure.NO_NUMBERS),
         ("Hero-SMS NO_BALANCE", SmsFailure.NO_BALANCE),
+        ("Hero-SMS NOT_ENOUGH_BALANCE", SmsFailure.NO_BALANCE),
         ("Hero-SMS BAD_KEY", SmsFailure.BAD_KEY),
         ("Hero-SMS INVALID_KEY", SmsFailure.BAD_KEY),
         ("Hero-SMS WRONG_KEY", SmsFailure.BAD_KEY),

@@ -141,7 +141,7 @@ def classify_provider_failure(message: str) -> SmsFailure:
     value = str(message or "").casefold()
     if "no_numbers" in value or "numbers not found" in value:
         return SmsFailure.NO_NUMBERS
-    if "no_balance" in value:
+    if "no_balance" in value or "not_enough_balance" in value:
         return SmsFailure.NO_BALANCE
     if any(
         marker in value
