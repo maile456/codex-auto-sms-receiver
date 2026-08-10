@@ -1,0 +1,1760 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ChatGPT Session -> CPA / sub2api / Cockpit / Codex / AxonHub / Codex-Manager</title>
+    <meta name="theme-color" content="#24505a" />
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" sizes="any" />
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5f7f8;
+        --surface: #ffffff;
+        --surface-soft: #f0f4f5;
+        --line: #d9e1e4;
+        --line-strong: #b9c8ce;
+        --text: #142126;
+        --muted: #64747c;
+        --accent: #24505a;
+        --accent-strong: #173941;
+        --accent-soft: #e3f0f2;
+        --success: #1e6b50;
+        --danger: #a33b3b;
+        --warning: #8a5a14;
+        --shadow: 0 16px 44px rgba(20, 33, 38, 0.08);
+        --radius: 8px;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        --sans: "Inter", "Avenir Next", "Helvetica Neue", "PingFang SC", "Noto Sans SC", sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        min-height: 100%;
+        margin: 0;
+      }
+
+      body {
+        font-family: var(--sans);
+        color: var(--text);
+        background:
+          linear-gradient(180deg, rgba(36, 80, 90, 0.06), transparent 240px),
+          var(--bg);
+      }
+
+      button,
+      input,
+      textarea {
+        font: inherit;
+      }
+
+      button {
+        border: 0;
+      }
+
+      .app {
+        width: min(1280px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 22px 0 28px;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 18px;
+        margin-bottom: 16px;
+      }
+
+      .title-block {
+        min-width: 0;
+      }
+
+      .eyebrow {
+        margin: 0 0 7px;
+        color: var(--accent);
+        font-size: 0.78rem;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(1.65rem, 3vw, 2.7rem);
+        line-height: 1.08;
+        letter-spacing: 0;
+      }
+
+      .title-targets {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      .title-targets span {
+        display: inline-flex;
+        align-items: center;
+        min-height: 30px;
+        padding: 5px 10px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+        color: var(--accent);
+        font-size: 0.86rem;
+        font-weight: 800;
+      }
+
+      .meta-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        justify-content: flex-end;
+      }
+
+      .meta-chip {
+        display: inline-flex;
+        align-items: center;
+        min-height: 32px;
+        padding: 6px 10px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+        color: var(--muted);
+        font-size: 0.86rem;
+        white-space: nowrap;
+      }
+
+      .github-link {
+        gap: 7px;
+        color: var(--text);
+        text-decoration: none;
+      }
+
+      .github-link:hover {
+        border-color: var(--line-strong);
+        background: var(--surface-soft);
+      }
+
+      .github-link svg {
+        width: 18px;
+        height: 18px;
+        flex: 0 0 auto;
+        fill: currentColor;
+      }
+
+      .toolbar {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+
+      .segmented {
+        display: inline-grid;
+        grid-template-columns: repeat(7, minmax(0, 1fr));
+        width: min(760px, 100%);
+        padding: 4px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+      }
+
+      .segmented button {
+        min-height: 38px;
+        min-width: 0;
+        padding: 0 8px;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--muted);
+        cursor: pointer;
+        line-height: 1.15;
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
+
+      .segmented button[aria-pressed="true"] {
+        background: var(--accent);
+        color: #fff;
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        justify-content: flex-end;
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 38px;
+        padding: 9px 13px;
+        border-radius: var(--radius);
+        cursor: pointer;
+        transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+      }
+
+      .button-primary {
+        background: var(--accent);
+        color: #fff;
+      }
+
+      .button-primary:hover {
+        background: var(--accent-strong);
+      }
+
+      .button-secondary,
+      .button-ghost {
+        border: 1px solid var(--line);
+        background: var(--surface);
+        color: var(--text);
+      }
+
+      .button-secondary:hover,
+      .button-ghost:hover {
+        border-color: var(--line-strong);
+        background: var(--surface-soft);
+      }
+
+      .button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      .workspace {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 12px;
+        align-items: stretch;
+      }
+
+      .panel {
+        min-width: 0;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+        box-shadow: var(--shadow);
+      }
+
+      .panel-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .panel-head h2 {
+        margin: 0;
+        font-size: 1rem;
+        line-height: 1.35;
+      }
+
+      .panel-head p {
+        margin: 4px 0 0;
+        color: var(--muted);
+        font-size: 0.88rem;
+        line-height: 1.45;
+      }
+
+      .panel-body {
+        padding: 14px 16px 16px;
+      }
+
+      .session-guide {
+        margin: 0 0 12px;
+        padding: 13px 14px;
+        border: 1px solid rgba(36, 80, 90, 0.34);
+        border-left: 5px solid var(--accent);
+        border-radius: var(--radius);
+        background: #eaf5f7;
+        color: var(--text);
+        line-height: 1.5;
+      }
+
+      .session-guide strong {
+        display: block;
+        margin-bottom: 4px;
+        color: var(--accent-strong);
+        font-size: 0.98rem;
+      }
+
+      .session-guide p {
+        margin: 0;
+        color: #33464d;
+        font-size: 0.9rem;
+      }
+
+      .session-guide a {
+        color: var(--accent-strong);
+        font-family: var(--mono);
+        font-weight: 800;
+        overflow-wrap: anywhere;
+      }
+
+      .session-guide .session-warning {
+        margin-top: 7px;
+        color: var(--danger);
+        font-weight: 700;
+      }
+
+      .discord-card {
+        position: relative;
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        gap: 12px 14px;
+        align-items: start;
+        margin-bottom: 12px;
+        padding: 14px 14px 52px;
+        border: 1px solid rgba(88, 101, 242, 0.28);
+        border-radius: var(--radius);
+        background: #f3f5ff;
+        color: #243064;
+        text-decoration: none;
+      }
+
+      .discord-card:hover {
+        border-color: rgba(88, 101, 242, 0.5);
+        background: #eef1ff;
+      }
+
+      .discord-icon {
+        display: grid;
+        width: 44px;
+        height: 44px;
+        place-items: center;
+        border-radius: var(--radius);
+        background: #5865f2;
+        color: #fff;
+      }
+
+      .discord-icon svg {
+        width: 27px;
+        height: 27px;
+        fill: currentColor;
+      }
+
+      .discord-copy strong {
+        display: block;
+        margin-bottom: 4px;
+        color: #1f2a62;
+        font-size: 0.98rem;
+        line-height: 1.35;
+      }
+
+      .discord-copy span {
+        display: block;
+        color: #46517f;
+        font-size: 0.88rem;
+        line-height: 1.45;
+      }
+
+      .discord-action {
+        position: absolute;
+        right: 14px;
+        bottom: 14px;
+        min-height: 32px;
+        padding: 6px 12px;
+        border-radius: 6px;
+        background: #5865f2;
+        color: #fff;
+        font-weight: 800;
+        white-space: nowrap;
+        box-shadow: 0 8px 18px rgba(88, 101, 242, 0.22);
+      }
+
+      .input-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        justify-content: space-between;
+        margin-bottom: 12px;
+      }
+
+      .textarea-shell {
+        position: relative;
+      }
+
+      textarea {
+        display: block;
+        width: 100%;
+        min-height: 430px;
+        resize: vertical;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 12px;
+        background: #fbfcfd;
+        color: var(--text);
+        font-family: var(--mono);
+        font-size: 0.84rem;
+        line-height: 1.5;
+        white-space: pre;
+      }
+
+      textarea:focus {
+        outline: 2px solid rgba(36, 80, 90, 0.22);
+        border-color: var(--accent);
+      }
+
+      textarea[readonly] {
+        background: #f8fafb;
+      }
+
+      .summary {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 8px;
+        margin-bottom: 12px;
+      }
+
+      .stat {
+        min-height: 72px;
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface-soft);
+      }
+
+      .stat-value {
+        font-family: var(--mono);
+        font-size: 1.22rem;
+        font-weight: 800;
+      }
+
+      .stat-label {
+        margin-top: 4px;
+        color: var(--muted);
+        font-size: 0.82rem;
+      }
+
+      .accounts {
+        overflow: auto;
+        max-height: 212px;
+        margin-bottom: 12px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        table-layout: fixed;
+        font-size: 0.86rem;
+      }
+
+      th,
+      td {
+        padding: 9px 10px;
+        border-bottom: 1px solid var(--line);
+        text-align: left;
+        vertical-align: top;
+      }
+
+      th {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        background: var(--surface-soft);
+        color: var(--muted);
+        font-size: 0.78rem;
+        font-weight: 800;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      .col-name {
+        width: 23%;
+      }
+
+      .col-email {
+        width: 31%;
+      }
+
+      .col-expiry {
+        width: 24%;
+      }
+
+      .cell-clip {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .empty {
+        color: var(--muted);
+      }
+
+      .status-line {
+        min-height: 22px;
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 0.88rem;
+        line-height: 1.45;
+      }
+
+      .status-line.is-ok {
+        color: var(--success);
+      }
+
+      .status-line.is-error {
+        color: var(--danger);
+      }
+
+      .issues {
+        display: none;
+        margin: 0 0 12px;
+        padding: 10px 12px;
+        border: 1px solid rgba(163, 59, 59, 0.22);
+        border-radius: var(--radius);
+        background: #fff7f7;
+        color: var(--danger);
+        font-size: 0.88rem;
+        line-height: 1.45;
+      }
+
+      .issues.is-visible {
+        display: block;
+      }
+
+      .notice {
+        margin: 0 0 12px;
+        padding: 10px 12px;
+        border: 1px solid rgba(138, 90, 20, 0.22);
+        border-radius: var(--radius);
+        background: #fffaf0;
+        color: var(--warning);
+        font-size: 0.88rem;
+        line-height: 1.45;
+      }
+
+      .hidden {
+        display: none !important;
+      }
+
+      @media (max-width: 960px) {
+        .topbar,
+        .toolbar,
+        .workspace {
+          grid-template-columns: 1fr;
+        }
+
+        .topbar {
+          align-items: flex-start;
+        }
+
+        .meta-row,
+        .actions {
+          justify-content: flex-start;
+        }
+
+        .workspace {
+          display: block;
+        }
+
+        .panel + .panel {
+          margin-top: 12px;
+        }
+      }
+
+      @media (max-width: 620px) {
+        .app {
+          width: min(100vw - 20px, 1280px);
+          padding-top: 14px;
+        }
+
+        .toolbar {
+          display: block;
+        }
+
+        .segmented {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          width: 100%;
+          margin-bottom: 10px;
+        }
+
+        .actions,
+        .input-actions {
+          display: grid;
+          grid-template-columns: 1fr;
+        }
+
+        .button {
+          width: 100%;
+        }
+
+        .summary {
+          grid-template-columns: 1fr;
+        }
+
+        .discord-card {
+          grid-template-columns: auto minmax(0, 1fr);
+        }
+
+        .col-expiry,
+        .col-type,
+        td:nth-child(3),
+        td:nth-child(4),
+        th:nth-child(3),
+        th:nth-child(4) {
+          display: none;
+        }
+
+        .col-name,
+        .col-email {
+          width: 50%;
+        }
+
+        textarea {
+          min-height: 320px;
+          font-size: 0.8rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <div class="title-block">
+          <p class="eyebrow">Local JSON Converter</p>
+          <h1>ChatGPT Session Converter</h1>
+          <div class="title-targets" aria-label="支持输出格式">
+            <span>CPA</span>
+            <span>sub2api</span>
+            <span>Cockpit</span>
+            <span>9router</span>
+            <span>Codex</span>
+            <span>AxonHub</span>
+            <span>Codex-Manager</span>
+          </div>
+        </div>
+        <div class="meta-row" aria-label="处理方式">
+          <span class="meta-chip">浏览器本地解析</span>
+          <span class="meta-chip">不上传 token</span>
+          <span class="meta-chip">不写入存储</span>
+          <a
+            class="meta-chip github-link"
+            href="https://github.com/gtxx3600/GPTSession2CPAandSub2API"
+            target="_blank"
+            rel="noreferrer"
+            aria-label="本页面代码开源"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.44 9.8 8.21 11.39.6.11.82-.26.82-.58v-2.24c-3.34.73-4.04-1.42-4.04-1.42-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.21.08 1.85 1.24 1.85 1.24 1.07 1.84 2.81 1.31 3.5 1 .11-.78.42-1.31.76-1.61-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23A11.5 11.5 0 0 1 12 5.78c1.02 0 2.05.14 3.01.41 2.29-1.55 3.3-1.23 3.3-1.23.66 1.66.24 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.63-5.49 5.93.43.37.82 1.1.82 2.22v3.3c0 .32.22.7.83.58A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12Z" />
+            </svg>
+            <span>本页面代码开源</span>
+          </a>
+        </div>
+      </header>
+
+      <section class="toolbar" aria-label="输出控制">
+        <div class="segmented" role="group" aria-label="输出格式">
+          <button type="button" data-format="sub2api" aria-pressed="true">sub2api</button>
+          <button type="button" data-format="cpa" aria-pressed="false">CPA</button>
+          <button type="button" data-format="cockpit" aria-pressed="false">Cockpit</button>
+          <button type="button" data-format="9router" aria-pressed="false">9router</button>
+          <button type="button" data-format="codex" aria-pressed="false">Codex</button>
+          <button type="button" data-format="axonhub" aria-pressed="false">AxonHub</button>
+          <button type="button" data-format="codexmanager" aria-pressed="false">Codex-Manager</button>
+        </div>
+        <div class="actions">
+          <button class="button button-secondary" id="copy-output" type="button" disabled>复制输出</button>
+          <button class="button button-primary" id="download-output" type="button" disabled>下载 JSON</button>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <section class="panel" aria-labelledby="input-title">
+          <div class="panel-head">
+            <div>
+              <h2 id="input-title">Session JSON</h2>
+              <p>粘贴 ChatGPT Web session，或拖入一个或多个 JSON 文件。</p>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="session-guide">
+              <strong>Session 数据从这里获取</strong>
+              <p>
+                先在浏览器登录 ChatGPT，然后打开
+                <a href="https://chatgpt.com/api/auth/session" target="_blank" rel="noreferrer">https://chatgpt.com/api/auth/session</a>
+                ，复制页面显示的整段 JSON，粘贴到下方输入框。
+              </p>
+              <p class="session-warning">OpenAI 已限制通过 Web session 转换导入来跳过 Codex OAuth add phone / 手机绑定验证；本页面仅用于格式转换。</p>
+              <p class="session-warning">这段 JSON 包含 accessToken 和 sessionToken，等同敏感登录凭证，不要发给别人。</p>
+            </div>
+            <a class="discord-card" href="https://discord.gg/GFmHY2TZNy" target="_blank" rel="noreferrer">
+              <span class="discord-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <path d="M20.32 4.37A19.8 19.8 0 0 0 15.36 2.83a13.8 13.8 0 0 0-.64 1.31 18.4 18.4 0 0 0-5.44 0 13.8 13.8 0 0 0-.65-1.31 19.7 19.7 0 0 0-4.96 1.54C.54 9.04-.31 13.6.1 18.1a19.9 19.9 0 0 0 6.08 3.08c.49-.67.93-1.38 1.3-2.13a12.8 12.8 0 0 1-2.05-.98c.17-.13.34-.26.5-.39a14.2 14.2 0 0 0 12.14 0c.17.14.33.27.5.39-.65.39-1.34.72-2.06.99.38.74.81 1.45 1.3 2.12a19.9 19.9 0 0 0 6.09-3.08c.48-5.22-.82-9.74-3.58-13.73ZM8.02 15.33c-1.19 0-2.16-1.08-2.16-2.41 0-1.33.95-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.33-.95 2.41-2.16 2.41Zm7.96 0c-1.19 0-2.16-1.08-2.16-2.41 0-1.33.95-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.33-.95 2.41-2.16 2.41Z" />
+                </svg>
+              </span>
+              <span class="discord-copy">
+                <strong>加入 Discord 频道免费获取 GPT 撸羊毛信息</strong>
+                <span>本工具现在主要用于已有 JSON 的格式转换。转换结果是否能使用，取决于 OpenAI 和目标工具当前的认证限制、账号权限以及 token 是否仍然有效。</span>
+              </span>
+              <span class="discord-action">加入频道</span>
+            </a>
+            <input class="hidden" id="file-input" type="file" accept=".json,application/json" multiple />
+            <div class="input-actions">
+              <button class="button button-secondary" id="pick-files" type="button">选择文件</button>
+              <button class="button button-secondary" id="load-example" type="button">填入示例结构</button>
+              <button class="button button-ghost" id="clear-input" type="button">清空</button>
+            </div>
+            <textarea
+              id="session-input"
+              spellcheck="false"
+              placeholder='{"user":{"email":"mark@example.com"},"expires":"2026-08-06T14:29:36.155Z","account":{"id":"...","planType":"plus"},"accessToken":"...","sessionToken":"..."}'
+            ></textarea>
+            <div class="status-line" id="input-status">等待输入。</div>
+          </div>
+        </section>
+
+        <section class="panel" aria-labelledby="output-title">
+          <div class="panel-head">
+            <div>
+              <h2 id="output-title">转换结果</h2>
+              <p id="output-subtitle">当前输出为 sub2api 导入 JSON。</p>
+            </div>
+          </div>
+          <div class="panel-body">
+            <p class="notice" id="cpa-notice">
+              本页面仅做格式转换，不能绕过 Codex OAuth add phone / 手机绑定验证。ChatGPT Web session 一般没有 `refresh_token`；缺少真实 `id_token` 时 CPA、Cockpit、Codex 和 AxonHub 会构造 Codex 可解析的占位 JWT claims。Codex 和 Codex-Manager 会保留空 `refresh_token`；AxonHub 缺少真实 `refresh_token` 时会写入占位值。
+            </p>
+            <div class="summary" aria-label="转换统计">
+              <div class="stat">
+                <div class="stat-value" id="stat-count">0</div>
+                <div class="stat-label">账号数</div>
+              </div>
+              <div class="stat">
+                <div class="stat-value" id="stat-format">sub2api</div>
+                <div class="stat-label">输出格式</div>
+              </div>
+              <div class="stat">
+                <div class="stat-value" id="stat-errors">0</div>
+                <div class="stat-label">跳过项</div>
+              </div>
+            </div>
+            <div class="accounts" aria-label="账号预览">
+              <table>
+                <colgroup>
+                  <col class="col-name" />
+                  <col class="col-email" />
+                  <col class="col-expiry" />
+                  <col class="col-type" />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>邮箱</th>
+                    <th>过期时间</th>
+                    <th>来源</th>
+                  </tr>
+                </thead>
+                <tbody id="account-body">
+                  <tr>
+                    <td colspan="4" class="empty">暂无可转换账号。</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="issues" id="issues"></div>
+            <textarea id="output" readonly spellcheck="false" placeholder="转换后会显示 JSON。"></textarea>
+            <div class="status-line" id="output-status">暂无输出。</div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script>
+      (() => {
+        const OUTPUT_LABELS = {
+          sub2api: "sub2api",
+          cpa: "CPA",
+          cockpit: "Cockpit",
+          "9router": "9router",
+          codex: "Codex",
+          axonhub: "AxonHub",
+          codexmanager: "Codex-Manager",
+        };
+
+        const state = {
+          format: "sub2api",
+          sessions: [],
+          converted: [],
+          skipped: [],
+          outputText: "",
+        };
+
+        const elements = {
+          accountBody: document.querySelector("#account-body"),
+          clearInput: document.querySelector("#clear-input"),
+          copyOutput: document.querySelector("#copy-output"),
+          cpaNotice: document.querySelector("#cpa-notice"),
+          downloadOutput: document.querySelector("#download-output"),
+          fileInput: document.querySelector("#file-input"),
+          formatButtons: Array.from(document.querySelectorAll("[data-format]")),
+          input: document.querySelector("#session-input"),
+          inputStatus: document.querySelector("#input-status"),
+          issues: document.querySelector("#issues"),
+          loadExample: document.querySelector("#load-example"),
+          output: document.querySelector("#output"),
+          outputStatus: document.querySelector("#output-status"),
+          outputSubtitle: document.querySelector("#output-subtitle"),
+          pickFiles: document.querySelector("#pick-files"),
+          statCount: document.querySelector("#stat-count"),
+          statErrors: document.querySelector("#stat-errors"),
+          statFormat: document.querySelector("#stat-format"),
+        };
+
+        const exampleSession = {
+          user: {
+            id: "user-example",
+            email: "mark@example.com",
+          },
+          expires: "2026-08-06T14:29:36.155Z",
+          account: {
+            id: "00000000-0000-4000-9000-000000000000",
+            planType: "plus",
+          },
+          accessToken: "paste-real-access-token-here",
+          sessionToken: "paste-real-session-token-here",
+          authProvider: "openai",
+        };
+
+        const AXONHUB_PLACEHOLDER_REFRESH_TOKEN = "__missing_refresh_token__";
+
+        function isPlainObject(value) {
+          return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+        }
+
+        function firstNonEmpty(...values) {
+          for (const value of values) {
+            if (typeof value === "string" && value.trim() !== "") {
+              return value.trim();
+            }
+          }
+          return undefined;
+        }
+
+        function escapeHtml(value) {
+          return String(value ?? "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+        }
+
+        function decodeBase64Url(value) {
+          const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+          const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+          const binary = atob(padded);
+          const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+          return new TextDecoder().decode(bytes);
+        }
+
+        function bytesToBase64Url(bytes) {
+          let binary = "";
+          for (let index = 0; index < bytes.length; index += 0x8000) {
+            binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+          }
+          return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+        }
+
+        function encodeBase64UrlJson(value) {
+          return bytesToBase64Url(new TextEncoder().encode(JSON.stringify(value)));
+        }
+
+        function parseJwtPayload(token) {
+          if (typeof token !== "string" || token.trim() === "") {
+            return undefined;
+          }
+
+          const segments = token.split(".");
+          if (segments.length < 2) {
+            return undefined;
+          }
+
+          try {
+            return JSON.parse(decodeBase64Url(segments[1]));
+          } catch {
+            return undefined;
+          }
+        }
+
+        function getOpenAIAuthSection(payload) {
+          if (!isPlainObject(payload)) {
+            return {};
+          }
+
+          const auth = payload["https://api.openai.com/auth"];
+          return isPlainObject(auth) ? auth : {};
+        }
+
+        function getOpenAIProfileSection(payload) {
+          if (!isPlainObject(payload)) {
+            return {};
+          }
+
+          const profile = payload["https://api.openai.com/profile"];
+          return isPlainObject(profile) ? profile : {};
+        }
+
+        function normalizeTimestamp(value) {
+          if (value instanceof Date && !Number.isNaN(value.getTime())) {
+            return value.toISOString();
+          }
+
+          if (typeof value === "number" && Number.isFinite(value)) {
+            const milliseconds = value > 1e11 ? value : value * 1000;
+            const date = new Date(milliseconds);
+            return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+          }
+
+          if (typeof value !== "string" || value.trim() === "") {
+            return undefined;
+          }
+
+          const date = new Date(value);
+          return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+        }
+
+        function timestampFromUnixSeconds(value) {
+          const numeric = Number(value);
+          if (!Number.isFinite(numeric)) {
+            return undefined;
+          }
+
+          const date = new Date(numeric * 1000);
+          return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+        }
+
+        function unixSecondsFromJwtExp(value) {
+          const numeric = Number(value);
+          if (!Number.isFinite(numeric) || numeric <= 0) {
+            return undefined;
+          }
+
+          return Math.trunc(numeric);
+        }
+
+        function epochSecondsFromValue(value) {
+          if (value === undefined || value === null || value === "") {
+            return 0;
+          }
+
+          const numeric = Number(value);
+          if (Number.isFinite(numeric)) {
+            return Math.trunc(numeric > 1e11 ? numeric / 1000 : numeric);
+          }
+
+          const parsed = Date.parse(String(value));
+          return Number.isFinite(parsed) ? Math.trunc(parsed / 1000) : 0;
+        }
+
+        function buildSyntheticCodexIdToken(email, accountId, planType, userId, expiresAt) {
+          if (!accountId) {
+            return undefined;
+          }
+
+          const now = Math.trunc(Date.now() / 1000);
+          const authInfo = { chatgpt_account_id: accountId };
+          const expires = epochSecondsFromValue(expiresAt) || now + 90 * 24 * 60 * 60;
+
+          if (planType) {
+            authInfo.chatgpt_plan_type = planType;
+          }
+
+          if (userId) {
+            authInfo.chatgpt_user_id = userId;
+            authInfo.user_id = userId;
+          }
+
+          const payload = {
+            iat: now,
+            exp: expires,
+            "https://api.openai.com/auth": authInfo,
+          };
+
+          if (email) {
+            payload.email = email;
+          }
+
+          return `${encodeBase64UrlJson({ alg: "none", typ: "JWT", cpa_synthetic: true })}.${encodeBase64UrlJson(payload)}.synthetic`;
+        }
+
+        function getExpiresIn(expiresAt, now = new Date()) {
+          if (!expiresAt) {
+            return undefined;
+          }
+
+          const expiresMs = new Date(expiresAt).getTime();
+          if (Number.isNaN(expiresMs)) {
+            return undefined;
+          }
+
+          return Math.max(0, Math.floor((expiresMs - now.getTime()) / 1000));
+        }
+
+        function getAxonHubLastRefresh(expiresAt, now = new Date()) {
+          const expiresMs = expiresAt ? new Date(expiresAt).getTime() : NaN;
+          if (Number.isNaN(expiresMs)) {
+            return normalizeTimestamp(now);
+          }
+
+          return new Date(expiresMs - 60 * 60 * 1000).toISOString();
+        }
+
+        function stripUnavailable(value) {
+          if (Array.isArray(value)) {
+            return value.map(stripUnavailable).filter((item) => item !== undefined);
+          }
+
+          if (isPlainObject(value)) {
+            const entries = Object.entries(value)
+              .map(([key, item]) => [key, stripUnavailable(item)])
+              .filter(([, item]) => item !== undefined);
+            return entries.length ? Object.fromEntries(entries) : undefined;
+          }
+
+          if (value === undefined || value === null || value === "") {
+            return undefined;
+          }
+
+          return value;
+        }
+
+        function toEmailKey(email) {
+          if (typeof email !== "string") {
+            return undefined;
+          }
+
+          return email
+            .trim()
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "_")
+            .replace(/^_+|_+$/g, "");
+        }
+
+        function sanitizeFileToken(value, fallback = "chatgpt-session") {
+          const base = firstNonEmpty(value, fallback) || fallback;
+          return base
+            .replace(/\.[^.]+$/u, "")
+            .replace(/[\\/:*?"<>|]+/g, "-")
+            .replace(/\s+/g, "-")
+            .replace(/-+/g, "-")
+            .replace(/^-+|-+$/g, "")
+            .toLowerCase()
+            .slice(0, 80) || fallback;
+        }
+
+        function getTimestampToken(date = new Date()) {
+          const pad = (value) => String(value).padStart(2, "0");
+          return [
+            date.getFullYear(),
+            pad(date.getMonth() + 1),
+            pad(date.getDate()),
+          ].join("-") + "_" + [
+            pad(date.getHours()),
+            pad(date.getMinutes()),
+            pad(date.getSeconds()),
+          ].join("-");
+        }
+
+        function formatDisplayDate(value) {
+          if (!value) {
+            return "";
+          }
+
+          const date = new Date(value);
+          if (Number.isNaN(date.getTime())) {
+            return value;
+          }
+
+          const pad = (item) => String(item).padStart(2, "0");
+          return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+        }
+
+        function collectSessionLikeObjects(value, sourceName = "pasted-json") {
+          const found = [];
+          const visited = new WeakSet();
+
+          function visit(item, path) {
+            if (!isPlainObject(item) && !Array.isArray(item)) {
+              return;
+            }
+
+            if (isPlainObject(item)) {
+              if (visited.has(item)) {
+                return;
+              }
+              visited.add(item);
+
+              const token = firstNonEmpty(
+                item.accessToken,
+                item.access_token,
+                item.tokens?.accessToken,
+                item.tokens?.access_token,
+                item.token?.accessToken,
+                item.token?.access_token,
+                item.credentials?.accessToken,
+                item.credentials?.access_token,
+              );
+              const hasIdentity = isPlainObject(item.user) || firstNonEmpty(
+                item.email,
+                item.name,
+                item.label,
+                item.meta?.label,
+                item.tokens?.accountId,
+                item.tokens?.account_id,
+                item.tokens?.chatgptAccountId,
+                item.tokens?.chatgpt_account_id,
+                item.providerSpecificData?.chatgptAccountId,
+                item.providerSpecificData?.chatgpt_account_id,
+                item.id,
+              );
+              if (token && hasIdentity) {
+                found.push({ value: item, sourceName, path });
+                return;
+              }
+
+              for (const [key, child] of Object.entries(item)) {
+                if (key === "accessToken" || key === "access_token" || key === "sessionToken") {
+                  continue;
+                }
+                visit(child, `${path}.${key}`);
+              }
+              return;
+            }
+
+            item.forEach((child, index) => visit(child, `${path}[${index}]`));
+          }
+
+          visit(value, "$");
+          return found;
+        }
+
+        function parseInputDocuments(text) {
+          if (typeof text !== "string" || text.trim() === "") {
+            return [];
+          }
+
+          let parsed;
+          try {
+            parsed = JSON.parse(text);
+          } catch (error) {
+            throw new Error(`JSON 解析失败：${error.message}`);
+          }
+
+          return collectSessionLikeObjects(parsed);
+        }
+
+        function convertSession(record, options = {}) {
+          if (!isPlainObject(record)) {
+            throw new Error("session 不是 JSON 对象");
+          }
+
+          const accessToken = firstNonEmpty(
+            record.accessToken,
+            record.access_token,
+            record.tokens?.accessToken,
+            record.tokens?.access_token,
+            record.token?.accessToken,
+            record.token?.access_token,
+            record.credentials?.accessToken,
+            record.credentials?.access_token,
+          );
+          if (!accessToken) {
+            throw new Error("缺少 accessToken");
+          }
+          const sessionToken = firstNonEmpty(
+            record.sessionToken,
+            record.session_token,
+            record.tokens?.sessionToken,
+            record.tokens?.session_token,
+            record.token?.sessionToken,
+            record.token?.session_token,
+            record.credentials?.session_token,
+          );
+          const refreshToken = firstNonEmpty(
+            record.refreshToken,
+            record.refresh_token,
+            record.tokens?.refreshToken,
+            record.tokens?.refresh_token,
+            record.token?.refreshToken,
+            record.token?.refresh_token,
+            record.credentials?.refresh_token,
+          );
+          const inputIdToken = firstNonEmpty(
+            record.idToken,
+            record.id_token,
+            record.tokens?.idToken,
+            record.tokens?.id_token,
+            record.token?.idToken,
+            record.token?.id_token,
+            record.credentials?.id_token,
+          );
+
+          const payload = parseJwtPayload(accessToken);
+          const idPayload = parseJwtPayload(inputIdToken);
+          const auth = getOpenAIAuthSection(payload);
+          const idAuth = getOpenAIAuthSection(idPayload);
+          const profile = getOpenAIProfileSection(payload);
+          const hasRefreshToken = Boolean(refreshToken);
+          const accessTokenExpiresAt = hasRefreshToken ? undefined : unixSecondsFromJwtExp(payload?.exp);
+          const expiresAt = hasRefreshToken ? undefined : firstNonEmpty(
+            payload ? timestampFromUnixSeconds(payload.exp) : undefined,
+            normalizeTimestamp(record.expires),
+            normalizeTimestamp(record.expiresAt),
+            normalizeTimestamp(record.expired),
+            normalizeTimestamp(record.expires_at),
+          );
+          const email = firstNonEmpty(
+            record.user?.email,
+            record.email,
+            record.meta?.label,
+            record.label,
+            record.credentials?.email,
+            record.providerSpecificData?.email,
+            profile.email,
+            idPayload?.email,
+            payload?.email,
+          );
+          const accountId = firstNonEmpty(
+            record.account?.id,
+            record.account_id,
+            record.tokens?.accountId,
+            record.tokens?.account_id,
+            record.chatgptAccountId,
+            record.chatgpt_account_id,
+            record.meta?.chatgptAccountId,
+            record.meta?.chatgpt_account_id,
+            record.tokens?.chatgptAccountId,
+            record.tokens?.chatgpt_account_id,
+            record.providerSpecificData?.chatgptAccountId,
+            record.providerSpecificData?.chatgpt_account_id,
+            record.credentials?.chatgpt_account_id,
+            auth.chatgpt_account_id,
+            idAuth.chatgpt_account_id,
+            record.provider === "codex" ? record.id : undefined,
+          );
+          const chatgptAccountId = firstNonEmpty(
+            record.chatgptAccountId,
+            record.chatgpt_account_id,
+            record.meta?.chatgptAccountId,
+            record.meta?.chatgpt_account_id,
+            record.tokens?.chatgptAccountId,
+            record.tokens?.chatgpt_account_id,
+            record.providerSpecificData?.chatgptAccountId,
+            record.providerSpecificData?.chatgpt_account_id,
+            record.credentials?.chatgpt_account_id,
+            auth.chatgpt_account_id,
+            idAuth.chatgpt_account_id,
+          );
+          const workspaceId = firstNonEmpty(
+            record.account?.workspaceId,
+            record.account?.workspace_id,
+            record.workspaceId,
+            record.workspace_id,
+            record.meta?.workspaceId,
+            record.meta?.workspace_id,
+            record.providerSpecificData?.workspaceId,
+            record.providerSpecificData?.workspace_id,
+            record.credentials?.workspace_id,
+            payload?.workspace_id,
+            idPayload?.workspace_id,
+          );
+          const userId = firstNonEmpty(
+            record.user?.id,
+            record.user_id,
+            record.chatgptUserId,
+            record.providerSpecificData?.chatgptUserId,
+            record.providerSpecificData?.chatgpt_user_id,
+            auth.chatgpt_user_id,
+            auth.user_id,
+            idAuth.chatgpt_user_id,
+            idAuth.user_id,
+          );
+          const planType = firstNonEmpty(
+            record.account?.planType,
+            record.account?.plan_type,
+            record.planType,
+            record.plan_type,
+            record.providerSpecificData?.chatgptPlanType,
+            record.providerSpecificData?.chatgpt_plan_type,
+            record.credentials?.plan_type,
+            auth.chatgpt_plan_type,
+            idAuth.chatgpt_plan_type,
+          );
+          const exportedAt = normalizeTimestamp(options.now || new Date());
+          const expiresIn = getExpiresIn(expiresAt, options.now || new Date());
+          const sourceName = firstNonEmpty(options.sourceName, "pasted-json");
+          const sourceType = record.provider === "codex" && record.authType === "oauth" ? "9router" : "chatgpt_web_session";
+          const name = firstNonEmpty(email, sourceName, "ChatGPT Account");
+          const syntheticIdToken = !inputIdToken
+            ? buildSyntheticCodexIdToken(email, accountId, planType, userId, expiresAt)
+            : undefined;
+          const idToken = firstNonEmpty(inputIdToken, syntheticIdToken);
+
+          const cpa = Object.fromEntries(Object.entries({
+            type: "codex",
+            account_id: accountId,
+            chatgpt_account_id: accountId,
+            email,
+            name,
+            plan_type: planType,
+            chatgpt_plan_type: planType,
+            id_token: idToken,
+            id_token_synthetic: Boolean(syntheticIdToken) || undefined,
+            access_token: accessToken,
+            refresh_token: refreshToken || "",
+            session_token: sessionToken,
+            last_refresh: exportedAt,
+            expired: expiresAt,
+            disabled: Boolean(record.disabled) || undefined,
+          }).filter(([, value]) => value !== undefined && value !== null));
+
+          const cockpit = {
+            type: "codex",
+            id_token: idToken,
+            access_token: accessToken,
+            refresh_token: refreshToken || "",
+            account_id: accountId,
+            last_refresh: exportedAt,
+            email,
+            expired: expiresAt,
+            account_note: firstNonEmpty(record.account_note, record.accountInfo, record.account_info, record.note, record.notes, record.remark),
+          };
+
+          const sub2apiAccount = stripUnavailable({
+            name: firstNonEmpty(name, email, sourceName, "ChatGPT Account"),
+            platform: "openai",
+            type: "oauth",
+            expires_at: accessTokenExpiresAt,
+            auto_pause_on_expired: accessTokenExpiresAt ? true : undefined,
+            concurrency: 10,
+            priority: 1,
+            credentials: {
+              access_token: accessToken,
+              chatgpt_account_id: accountId,
+              chatgpt_user_id: userId,
+              email,
+              expires_at: expiresAt,
+              expires_in: expiresIn,
+              plan_type: planType,
+            },
+            extra: {
+              email,
+              email_key: toEmailKey(email),
+              name,
+              auth_provider: firstNonEmpty(record.authProvider, record.auth_provider),
+              source: sourceType,
+              last_refresh: exportedAt,
+            },
+          });
+          const priority = Number.isFinite(Number(record.priority)) ? Number(record.priority) : 9;
+          const isActive = typeof record.isActive === "boolean" ? record.isActive : !Boolean(record.disabled);
+          const createdAt = normalizeTimestamp(record.createdAt) || exportedAt;
+          const updatedAt = normalizeTimestamp(record.updatedAt) || exportedAt;
+          const nineRouter = stripUnavailable({
+            accessToken,
+            refreshToken,
+            expiresAt,
+            testStatus: firstNonEmpty(record.testStatus, record.test_status, "active"),
+            expiresIn,
+            providerSpecificData: {
+              chatgptAccountId: accountId,
+              chatgptPlanType: planType,
+            },
+            id: accountId,
+            provider: "codex",
+            authType: "oauth",
+            name,
+            email,
+            priority,
+            isActive,
+            createdAt,
+            updatedAt,
+          });
+          const axonHubRefreshToken = refreshToken || AXONHUB_PLACEHOLDER_REFRESH_TOKEN;
+          const codexAuthJson = {
+            auth_mode: "chatgpt",
+            OPENAI_API_KEY: null,
+            tokens: {
+              id_token: idToken,
+              access_token: accessToken,
+              refresh_token: refreshToken || "",
+              account_id: accountId,
+            },
+            last_refresh: exportedAt,
+          };
+          const axonHub = stripUnavailable({
+            auth_mode: "chatgpt",
+            last_refresh: getAxonHubLastRefresh(expiresAt, options.now || new Date()),
+            tokens: {
+              access_token: accessToken,
+              refresh_token: axonHubRefreshToken,
+              id_token: idToken,
+            },
+            axonhub_refresh_token_placeholder: refreshToken ? undefined : true,
+            axonhub_note: refreshToken ? undefined : "refresh_token is a placeholder; access_token works only until it expires.",
+          });
+          const codexManagerTokenHints = Object.fromEntries(Object.entries({
+            account_id: accountId,
+            chatgpt_account_id: chatgptAccountId,
+          }).filter(([, value]) => value !== undefined && value !== null && value !== ""));
+          const codexManagerMeta = Object.fromEntries(Object.entries({
+            label: firstNonEmpty(name, email, sourceName, "ChatGPT Account"),
+            workspace_id: workspaceId,
+            chatgpt_account_id: chatgptAccountId,
+            note: "Imported from ChatGPT session",
+          }).filter(([, value]) => value !== undefined && value !== null && value !== ""));
+          const codexManager = {
+            tokens: {
+              access_token: accessToken,
+              refresh_token: refreshToken || "",
+              id_token: inputIdToken || "",
+              ...codexManagerTokenHints,
+            },
+            meta: codexManagerMeta,
+          };
+
+          return {
+            sourceName,
+            sourcePath: options.sourcePath,
+            email,
+            name,
+            expiresAt,
+            accessTokenExpiresAt,
+            cpa,
+            cockpit,
+            nineRouter,
+            codexAuthJson,
+            axonHub,
+            codexManager,
+            sub2apiAccount,
+          };
+        }
+
+        function buildSub2apiDocument(converted, now = new Date()) {
+          return {
+            exported_at: normalizeTimestamp(now),
+            proxies: [],
+            accounts: converted.map((item) => item.sub2apiAccount),
+          };
+        }
+
+        function buildOutputDocument() {
+          const now = new Date();
+          if (state.format === "sub2api") {
+            return buildSub2apiDocument(state.converted, now);
+          }
+
+          if (state.format === "cpa") {
+            return state.converted.length === 1
+              ? state.converted[0].cpa
+              : state.converted.map((item) => item.cpa);
+          }
+
+          if (state.format === "cockpit") {
+            return state.converted.length === 1
+              ? state.converted[0].cockpit
+              : state.converted.map((item) => item.cockpit);
+          }
+
+          if (state.format === "9router") {
+            return state.converted.length === 1
+              ? state.converted[0].nineRouter
+              : state.converted.map((item) => item.nineRouter);
+          }
+
+          if (state.format === "codex") {
+            return state.converted.length === 1
+              ? state.converted[0].codexAuthJson
+              : state.converted.map((item) => item.codexAuthJson);
+          }
+
+          if (state.format === "axonhub") {
+            return state.converted.length === 1
+              ? state.converted[0].axonHub
+              : state.converted.map((item) => item.axonHub);
+          }
+
+          if (state.format === "codexmanager") {
+            return state.converted.length === 1
+              ? state.converted[0].codexManager
+              : state.converted.map((item) => item.codexManager);
+          }
+
+          return buildSub2apiDocument(state.converted, now);
+        }
+
+        function convertFromText(text) {
+          const sources = parseInputDocuments(text);
+          const converted = [];
+          const skipped = [];
+          const now = new Date();
+
+          sources.forEach((item, index) => {
+            try {
+              converted.push(convertSession(item.value, {
+                now,
+                sourceName: item.sourceName,
+                sourcePath: item.path || `$[${index}]`,
+              }));
+            } catch (error) {
+              skipped.push({
+                sourceName: item.sourceName,
+                path: item.path,
+                reason: error instanceof Error ? error.message : "无法转换",
+              });
+            }
+          });
+
+          if (!sources.length) {
+            skipped.push({
+              sourceName: "pasted-json",
+              path: "$",
+              reason: "未找到包含 accessToken 和 user/email 的 session 对象",
+            });
+          }
+
+          state.converted = converted;
+          state.skipped = skipped;
+          state.sessions = sources;
+          updateOutput();
+        }
+
+        function setStatus(element, text, tone = "") {
+          element.textContent = text;
+          element.classList.toggle("is-ok", tone === "ok");
+          element.classList.toggle("is-error", tone === "error");
+        }
+
+        function updateOutput() {
+          const hasConverted = state.converted.length > 0;
+          let outputText = "";
+
+          if (hasConverted) {
+            outputText = JSON.stringify(buildOutputDocument(), null, 2);
+          }
+
+          state.outputText = outputText;
+          elements.output.value = outputText;
+          elements.copyOutput.disabled = !outputText;
+          elements.downloadOutput.disabled = !outputText;
+          elements.statCount.textContent = String(state.converted.length);
+          elements.statErrors.textContent = String(state.skipped.length);
+          elements.statFormat.textContent = OUTPUT_LABELS[state.format];
+          elements.outputSubtitle.textContent = `当前输出为 ${OUTPUT_LABELS[state.format]} 导入 JSON。`;
+          elements.cpaNotice.style.display = ["cpa", "cockpit", "codex", "axonhub", "codexmanager"].includes(state.format) ? "block" : "none";
+
+          renderAccounts();
+          renderIssues();
+
+          if (outputText) {
+            setStatus(elements.outputStatus, `已生成 ${state.converted.length} 个账号。`, "ok");
+          } else {
+            setStatus(elements.outputStatus, "暂无输出。", state.skipped.length ? "error" : "");
+          }
+        }
+
+        function renderAccounts() {
+          if (!state.converted.length) {
+            elements.accountBody.innerHTML = '<tr><td colspan="4" class="empty">暂无可转换账号。</td></tr>';
+            return;
+          }
+
+          elements.accountBody.innerHTML = state.converted.map((item) => `
+            <tr>
+              <td><div class="cell-clip" title="${escapeHtml(item.name)}">${escapeHtml(item.name || "-")}</div></td>
+              <td><div class="cell-clip" title="${escapeHtml(item.email)}">${escapeHtml(item.email || "-")}</div></td>
+              <td><div class="cell-clip" title="${escapeHtml(item.expiresAt)}">${escapeHtml(formatDisplayDate(item.expiresAt) || "-")}</div></td>
+              <td><div class="cell-clip" title="${escapeHtml(item.sourceName)}">${escapeHtml(item.sourceName || "pasted-json")}</div></td>
+            </tr>
+          `).join("");
+        }
+
+        function renderIssues() {
+          if (!state.skipped.length) {
+            elements.issues.classList.remove("is-visible");
+            elements.issues.textContent = "";
+            return;
+          }
+
+          elements.issues.classList.add("is-visible");
+          elements.issues.innerHTML = state.skipped
+            .map((item) => `<div>${escapeHtml(item.sourceName || "input")} ${escapeHtml(item.path || "")}: ${escapeHtml(item.reason)}</div>`)
+            .join("");
+        }
+
+        function scheduleConvert() {
+          const text = elements.input.value;
+          if (!text.trim()) {
+            state.converted = [];
+            state.skipped = [];
+            state.sessions = [];
+            updateOutput();
+            setStatus(elements.inputStatus, "等待输入。");
+            return;
+          }
+
+          try {
+            convertFromText(text);
+            if (state.converted.length) {
+              setStatus(elements.inputStatus, `解析完成：${state.converted.length} 个账号，跳过 ${state.skipped.length} 项。`, "ok");
+            } else {
+              setStatus(elements.inputStatus, "没有可转换账号。", "error");
+            }
+          } catch (error) {
+            state.converted = [];
+            state.skipped = [{
+              sourceName: "pasted-json",
+              path: "$",
+              reason: error instanceof Error ? error.message : "JSON 解析失败",
+            }];
+            state.outputText = "";
+            updateOutput();
+            setStatus(elements.inputStatus, error instanceof Error ? error.message : "JSON 解析失败", "error");
+          }
+        }
+
+        function downloadOutput() {
+          if (!state.outputText) {
+            return;
+          }
+
+          const first = state.converted[0];
+          const base = sanitizeFileToken(first?.email || first?.name || state.format);
+          const fileName = `${base}.${state.format}.${getTimestampToken()}.json`;
+          const blob = new Blob([state.outputText], { type: "application/json;charset=utf-8" });
+          const url = URL.createObjectURL(blob);
+          const anchor = document.createElement("a");
+          anchor.href = url;
+          anchor.download = fileName;
+          document.body.append(anchor);
+          anchor.click();
+          anchor.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+
+        async function copyOutput() {
+          if (!state.outputText) {
+            return;
+          }
+
+          try {
+            await navigator.clipboard.writeText(state.outputText);
+            setStatus(elements.outputStatus, "已复制到剪贴板。", "ok");
+          } catch {
+            elements.output.select();
+            document.execCommand("copy");
+            setStatus(elements.outputStatus, "已复制到剪贴板。", "ok");
+          }
+        }
+
+        async function readFiles(files) {
+          const jsonFiles = Array.from(files).filter((file) => file.name.toLowerCase().endsWith(".json"));
+          if (!jsonFiles.length) {
+            setStatus(elements.inputStatus, "没有选择 JSON 文件。", "error");
+            return;
+          }
+
+          const documents = [];
+          const skipped = [];
+
+          for (const file of jsonFiles) {
+            try {
+              const text = await file.text();
+              const parsed = JSON.parse(text);
+              const found = collectSessionLikeObjects(parsed, file.webkitRelativePath || file.name);
+              if (!found.length) {
+                skipped.push({
+                  sourceName: file.webkitRelativePath || file.name,
+                  path: "$",
+                  reason: "未找到包含 accessToken 和 user/email 的 session 对象",
+                });
+              }
+              documents.push(...found);
+            } catch (error) {
+              skipped.push({
+                sourceName: file.webkitRelativePath || file.name,
+                path: "$",
+                reason: error instanceof Error ? error.message : "无法读取文件",
+              });
+            }
+          }
+
+          const now = new Date();
+          const converted = [];
+          const convertSkipped = [...skipped];
+          documents.forEach((item) => {
+            try {
+              converted.push(convertSession(item.value, {
+                now,
+                sourceName: item.sourceName,
+                sourcePath: item.path,
+              }));
+            } catch (error) {
+              convertSkipped.push({
+                sourceName: item.sourceName,
+                path: item.path,
+                reason: error instanceof Error ? error.message : "无法转换",
+              });
+            }
+          });
+
+          state.sessions = documents;
+          state.converted = converted;
+          state.skipped = convertSkipped;
+          elements.input.value = documents.length === 1
+            ? JSON.stringify(documents[0].value, null, 2)
+            : JSON.stringify(documents.map((item) => item.value), null, 2);
+          updateOutput();
+          setStatus(elements.inputStatus, `读取 ${jsonFiles.length} 个文件，生成 ${converted.length} 个账号，跳过 ${convertSkipped.length} 项。`, converted.length ? "ok" : "error");
+        }
+
+        elements.formatButtons.forEach((button) => {
+          button.addEventListener("click", () => {
+            state.format = button.dataset.format;
+            elements.formatButtons.forEach((item) => {
+              item.setAttribute("aria-pressed", String(item === button));
+            });
+            updateOutput();
+          });
+        });
+
+        elements.input.addEventListener("input", scheduleConvert);
+        elements.copyOutput.addEventListener("click", copyOutput);
+        elements.downloadOutput.addEventListener("click", downloadOutput);
+        elements.pickFiles.addEventListener("click", () => elements.fileInput.click());
+        elements.fileInput.addEventListener("change", (event) => {
+          readFiles(event.target.files);
+          event.target.value = "";
+        });
+
+        elements.clearInput.addEventListener("click", () => {
+          elements.input.value = "";
+          scheduleConvert();
+        });
+
+        elements.loadExample.addEventListener("click", () => {
+          elements.input.value = JSON.stringify(exampleSession, null, 2);
+          scheduleConvert();
+        });
+
+        updateOutput();
+      })();
+    </script>
+  </body>
+</html>
