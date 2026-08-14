@@ -60,6 +60,10 @@ _NET_MAX_ATTEMPTS = 3
 _NET_BACKOFF_BASE = 2.0
 
 
+class InvalidEmailOtpError(RuntimeError):
+    """The current auth session rejected the submitted email OTP."""
+
+
 def _with_net_retry(label: str, fn):
     """
     对临时性网络错误（TLS/代理/超时/重置）做重试包装。
@@ -996,6 +1000,10 @@ def _submit_email_otp(session: BrowserSession, code: str) -> None:
                 f"[Codex] 账号已废（{body_error_code}）status={resp.status_code}: {(resp.text or '')[:200]}",
                 error_code=body_error_code,
             )
+        if error_code == "wrong_email_otp_code" or "Wrong code" in (resp.text or ""):
+            raise InvalidEmailOtpError(
+                f"[Codex] 邮箱 OTP 验证失败 status={resp.status_code}: {(resp.text or '')[:300]}"
+            )
         raise RuntimeError(
             f"[Codex] 邮箱 OTP 验证失败 status={resp.status_code}: {(resp.text or '')[:300]}"
         )
@@ -1594,8 +1602,7 @@ def run_codex_oauth(
                     detected_page or "unknown",
                 )
 
-            # 4. 收邮箱 OTP + 提交；若一直未收到，协议模式下重新提交邮箱触发重发。
-            email_otp = None
+            # 4. 收邮箱 OTP + 提交；未收到或当前码被拒时重新触发发码。
             try:
                 max_email_otp_attempts = int(
                     getattr(otp_provider, "codex_max_email_otp_attempts", 3) or 3
@@ -1607,7 +1614,6 @@ def run_codex_oauth(
                 logger.info(f"[Codex] 等待邮箱 OTP（第 {email_otp_attempt}/{max_email_otp_attempts} 次）")
                 try:
                     email_otp = otp_provider(email, after_ts=otp_after_ts)
-                    break
                 except Exception as exc:
                     if email_otp_attempt >= max_email_otp_attempts:
                         raise
@@ -1618,18 +1624,31 @@ def run_codex_oauth(
                         type(exc).__name__,
                         str(exc)[:180],
                     )
-                    otp_after_ts = time.time()
-                    if passwordless_email_otp:
+                else:
+                    logger.info("[Codex] 邮箱 OTP 已收到")
+                    human_delay("otp_input")
+                    try:
+                        _submit_email_otp(session, email_otp)
+                        break
+                    except InvalidEmailOtpError as exc:
+                        if email_otp_attempt >= max_email_otp_attempts:
+                            raise
+                        logger.warning(
+                            "[Codex] 当前邮箱 OTP 被拒，重新触发发码后继续（下一轮 %s/%s）：%s",
+                            email_otp_attempt + 1,
+                            max_email_otp_attempts,
+                            str(exc)[:180],
+                        )
+
+                otp_after_ts = time.time()
+                if passwordless_email_otp:
+                    _send_passwordless_email_otp(session)
+                else:
+                    retry_flow = _submit_email(session, email)
+                    if _is_login_password_flow(retry_flow):
+                        passwordless_email_otp = True
                         _send_passwordless_email_otp(session)
-                    else:
-                        retry_flow = _submit_email(session, email)
-                        if _is_login_password_flow(retry_flow):
-                            passwordless_email_otp = True
-                            _send_passwordless_email_otp(session)
-                    human_delay("api")
-            logger.info("[Codex] 邮箱 OTP 已收到")
-            human_delay("otp_input")
-            _submit_email_otp(session, email_otp)
+                human_delay("api")
             human_delay("api")
 
         # 5. 首次授权需要手机号验证；旧 refresh_token 已失效后的

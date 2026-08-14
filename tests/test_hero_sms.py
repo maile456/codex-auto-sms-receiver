@@ -95,6 +95,44 @@ def test_network_error_does_not_expose_key():
     assert "must-not-leak" not in str(raised.value)
 
 
+@pytest.mark.parametrize(
+    ("explicit_proxy", "proxy_pool", "expected"),
+    [
+        (
+            "socks5h://127.0.0.1:7897",
+            "http://fallback.example.test:8080",
+            "socks5h://127.0.0.1:7897",
+        ),
+        (
+            "",
+            '["http://first.example.test:8080", "http://second.example.test:8080"]',
+            "http://first.example.test:8080",
+        ),
+    ],
+)
+def test_hero_requests_use_explicit_proxy_or_proxy_pool_fallback(
+    monkeypatch, explicit_proxy, proxy_pool, expected
+):
+    monkeypatch.setenv("HERO_SMS_PROXY", explicit_proxy)
+    monkeypatch.setenv("PROXY_POOL", proxy_pool)
+
+    class ProxyRequiredHttp(FakeHttp):
+        def __init__(self):
+            super().__init__(FakeResponse(text="ACCESS_BALANCE:1"))
+            self.proxies = {}
+
+        def get(self, url, params):
+            if self.proxies.get("https") != expected:
+                raise TimeoutError("direct TLS timeout")
+            return super().get(url, params)
+
+    http = ProxyRequiredHttp()
+    result = HeroSmsAdapter("hero-secret").request(http, {"action": "getBalance"})
+
+    assert result == "ACCESS_BALANCE:1"
+    assert http.proxies == {"http": expected, "https": expected}
+
+
 def test_json_number_is_normalized_to_legacy_contract():
     http = FakeHttp(
         FakeResponse(

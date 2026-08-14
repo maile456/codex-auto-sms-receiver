@@ -176,7 +176,7 @@ def test_credential_reauth_skips_sms_patch_and_phone_verification(monkeypatch):
     assert cleaned == [True]
 
 
-def test_generic_api_otp_provider_uses_extended_wait_and_disables_resend(monkeypatch):
+def test_generic_api_otp_provider_uses_extended_wait_and_allows_one_resend(monkeypatch):
     project_root = Path(__file__).resolve().parents[1]
     settings = SimpleNamespace(project_root=project_root, data_dir=project_root / "data")
     upstream_bridge._ensure_upstream_imports(settings)
@@ -204,7 +204,7 @@ def test_generic_api_otp_provider_uses_extended_wait_and_disables_resend(monkeyp
             "after_ts": 123.0,
             "kwargs": {"max_wait": 90, "poll_interval": 2},
         }
-        assert provider.codex_max_email_otp_attempts == 1
+        assert provider.codex_max_email_otp_attempts == 2
     finally:
         cleanup()
 

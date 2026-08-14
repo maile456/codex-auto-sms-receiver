@@ -15,7 +15,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
@@ -33,6 +33,7 @@ _CODE_REGEX = re.compile(r"\b(\d{6})\b")
 _CONTEXT_WORDS = ("code", "verify", "verification", "验证码", "代码", "确认码", "認証", "コード")
 _MESSAGE_ID_REGEX = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _FRESHNESS_TOLERANCE_SECONDS = 3.0
+_LATEST_MAIL_TIMEZONE = timezone(timedelta(hours=8))
 _CONTEXT_CACHE: dict[str, "GenericApiEmailAccount"] = {}
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ACCOUNTS_FILE = _PROJECT_ROOT / "用于注册的API邮箱.txt"
@@ -88,6 +89,77 @@ class _InboxListParser(HTMLParser):
         )
         self._message_id = None
         self._text_parts = []
+
+
+class _LatestMailParser(HTMLParser):
+    """Parse the single-message ``latest mail`` page used by code URLs."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.heading_parts: list[str] = []
+        self.subject_parts: list[str] = []
+        self.content_parts: list[str] = []
+        self.metadata: dict[str, str] = {}
+        self._div_depth = 0
+        self._heading_depth = 0
+        self._capture_depths: dict[str, int | None] = {
+            "subject": None,
+            "label": None,
+            "value": None,
+            "content": None,
+        }
+        self._capture_parts: dict[str, list[str]] = {
+            key: [] for key in self._capture_depths
+        }
+        self._last_label = ""
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        tag_name = tag.casefold()
+        if tag_name == "h1":
+            self._heading_depth += 1
+            return
+        if tag_name != "div":
+            return
+        self._div_depth += 1
+        values = {str(key).casefold(): str(value or "") for key, value in attrs}
+        classes = {part.casefold() for part in values.get("class", "").split()}
+        for name in self._capture_depths:
+            if name in classes and self._capture_depths[name] is None:
+                self._capture_depths[name] = self._div_depth
+                self._capture_parts[name] = []
+
+    def handle_data(self, data: str) -> None:
+        value = data.strip()
+        if not value:
+            return
+        if self._heading_depth:
+            self.heading_parts.append(value)
+        for name, depth in self._capture_depths.items():
+            if depth is not None:
+                self._capture_parts[name].append(value)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag_name = tag.casefold()
+        if tag_name == "h1":
+            self._heading_depth = max(0, self._heading_depth - 1)
+            return
+        if tag_name != "div":
+            return
+        for name, depth in tuple(self._capture_depths.items()):
+            if depth != self._div_depth:
+                continue
+            value = " ".join(self._capture_parts[name]).strip()
+            if name == "subject":
+                self.subject_parts.append(value)
+            elif name == "content":
+                self.content_parts.append(value)
+            elif name == "label":
+                self._last_label = value
+            elif name == "value" and self._last_label:
+                self.metadata[self._last_label] = value
+            self._capture_depths[name] = None
+            self._capture_parts[name] = []
+        self._div_depth = max(0, self._div_depth - 1)
 
 
 def _flatten_json(obj) -> str:
@@ -321,6 +393,45 @@ def _inbox_messages(html_text: str) -> list[_InboxMessage]:
     return parser.messages
 
 
+def _extract_from_latest_mail_page(
+    html_text: str,
+    after_ts: float | None = None,
+) -> tuple[bool, str | None]:
+    """Extract an OTP from a timestamped single-message latest-mail page."""
+    parser = _LatestMailParser()
+    try:
+        parser.feed(html_text)
+        parser.close()
+    except Exception:
+        return False, None
+
+    heading = " ".join(parser.heading_parts)
+    subject = " ".join(parser.subject_parts)
+    content = " ".join(parser.content_parts)
+    received_at = parser.metadata.get("时间", "").strip()
+    if "最新邮件" not in heading or not subject or not received_at:
+        return False, None
+    if not _has_otp_context("\n".join((subject, content))):
+        return True, None
+
+    code = extract_otp({"subject": subject, "text": content})
+    if not code:
+        return True, None
+    if after_ts is None:
+        return True, code
+
+    try:
+        received_dt = datetime.strptime(received_at, "%Y-%m-%d %H:%M:%S")
+        received_ts = received_dt.replace(tzinfo=_LATEST_MAIL_TIMEZONE).timestamp()
+    except ValueError:
+        logger.debug("[GenericAPI] 最新邮件页面时间格式无法解析，已跳过以避免使用旧验证码")
+        return True, None
+    if received_ts < after_ts - _FRESHNESS_TOLERANCE_SECONDS:
+        logger.debug("[GenericAPI] 已跳过最新邮件页面中的旧验证码")
+        return True, None
+    return True, code
+
+
 def _inbox_detail_url(page_url: str, html_text: str, message_id: str) -> str | None:
     detail_base = _script_string(html_text, "detailBase")
     detail_suffix = _script_string(html_text, "detailSuffix")
@@ -430,6 +541,12 @@ def _fetch_current_code(
         response,
         page_url,
         headers,
+        after_ts=after_ts,
+    )
+    if recognized:
+        return code
+    recognized, code = _extract_from_latest_mail_page(
+        response.text or "",
         after_ts=after_ts,
     )
     if recognized:

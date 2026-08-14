@@ -40,6 +40,38 @@ class HeroSmsNoBalanceError(HeroSmsError):
     pass
 
 
+def _first_proxy(value: Any) -> str:
+    """Return the first configured proxy without logging credentials."""
+
+    if isinstance(value, (list, tuple)):
+        return next((str(item).strip() for item in value if str(item).strip()), "")
+    text = str(value or "").strip()
+    if not text or text == "[]":
+        return ""
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, list):
+            return _first_proxy(parsed)
+    return next(
+        (
+            item.strip()
+            for item in re.split(r"[\r\n,;]+", text)
+            if item.strip()
+        ),
+        "",
+    )
+
+
+def _hero_proxy_url() -> str:
+    explicit = _first_proxy(os.getenv("HERO_SMS_PROXY", ""))
+    if explicit:
+        return explicit
+    return _first_proxy(os.getenv("PROXY_POOL", ""))
+
+
 def _first_text(mapping: Mapping[str, Any], *keys: str) -> str:
     for key in keys:
         value = mapping.get(key)
@@ -59,6 +91,7 @@ class HeroSmsAdapter:
         self,
         api_key: str,
         *,
+        proxy_url: str | None = None,
         provider_error: type[Exception] = HeroSmsError,
         no_numbers_error: type[Exception] = HeroSmsNoNumbersError,
         no_balance_error: type[Exception] = HeroSmsNoBalanceError,
@@ -67,6 +100,22 @@ class HeroSmsAdapter:
         self._provider_error = provider_error
         self._no_numbers_error = no_numbers_error
         self._no_balance_error = no_balance_error
+        self._proxy_url = (
+            _hero_proxy_url() if proxy_url is None else _first_proxy(proxy_url)
+        )
+
+    def _configure_http(self, http: Any) -> None:
+        if not self._proxy_url:
+            return
+        try:
+            current = getattr(http, "proxies", None)
+            proxies = dict(current) if isinstance(current, Mapping) else {}
+            proxies.update({"http": self._proxy_url, "https": self._proxy_url})
+            http.proxies = proxies
+        except Exception as exc:
+            raise self._provider_error(
+                f"Hero-SMS proxy configuration failed ({type(exc).__name__})"
+            ) from exc
 
     def request(self, http: Any, params: Mapping[str, Any]) -> str:
         if not self._api_key:
@@ -113,6 +162,7 @@ class HeroSmsAdapter:
             "chatgpt",
         }:
             request_params["service"] = HERO_SMS_SERVICE_CODE
+        self._configure_http(http)
         try:
             response = http.get(HERO_SMS_API_BASE, params=request_params)
         except Exception as exc:
@@ -689,6 +739,12 @@ def install_hero_sms_patch(sms_provider: ModuleType | Any) -> HeroSmsPatch:
         no_numbers_error=sms_provider.SmsNoNumbersError,
         no_balance_error=sms_provider.SmsNoBalanceError,
     )
+    logger = getattr(sms_provider, "logger", None)
+    if logger is not None:
+        logger.info(
+            "[SMS:Hero] API transport=%s",
+            "proxy" if adapter._proxy_url else "direct",
+        )
 
     with _PATCH_LOCK:
         original = sms_provider._request_grizzly

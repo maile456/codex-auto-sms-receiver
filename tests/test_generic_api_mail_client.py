@@ -90,6 +90,77 @@ def test_plain_html_page_extracts_contextual_six_digit_code():
     assert [url for url, _kwargs in session.calls] == [page_url]
 
 
+def _latest_mail_html(code: str, received_at: str) -> str:
+    return f"""
+    <!doctype html>
+    <html lang="zh-CN">
+      <body>
+        <main class="wrap">
+          <h1>最新邮件</h1>
+          <section class="panel">
+            <div class="meta">
+              <div class="subject">ChatGPT temporary login code</div>
+              <div class="row"><div class="label">时间</div><div class="value">{received_at}</div></div>
+            </div>
+            <div class="content">
+              <style>body {{ color: #111827; }}</style>
+              <p>Your verification code is <strong>{code}</strong></p>
+            </div>
+          </section>
+        </main>
+      </body>
+    </html>
+    """
+
+
+def test_latest_mail_page_accepts_fresh_timestamped_otp():
+    page_url = "https://mail.example.test/mailbox/demo-token"
+    session = FakeSession(
+        {
+            page_url: FakeResponse(
+                url=page_url,
+                text=_latest_mail_html("654321", "2026-08-15 02:13:16"),
+            ),
+        }
+    )
+    after_ts = datetime(
+        2026, 8, 15, 2, 13, 14, tzinfo=timezone(timedelta(hours=8))
+    ).timestamp()
+
+    code = mail_client._fetch_current_code(
+        session,
+        page_url,
+        HEADERS,
+        after_ts=after_ts,
+    )
+
+    assert code == "654321"
+
+
+def test_latest_mail_page_rejects_otp_from_before_current_login():
+    page_url = "https://mail.example.test/mailbox/demo-token"
+    session = FakeSession(
+        {
+            page_url: FakeResponse(
+                url=page_url,
+                text=_latest_mail_html("123456", "2026-08-15 02:12:00"),
+            ),
+        }
+    )
+    after_ts = datetime(
+        2026, 8, 15, 2, 13, 14, tzinfo=timezone(timedelta(hours=8))
+    ).timestamp()
+
+    code = mail_client._fetch_current_code(
+        session,
+        page_url,
+        HEADERS,
+        after_ts=after_ts,
+    )
+
+    assert code is None
+
+
 def _inbox_html(items: list[tuple[str, str]], *, detail_base: str = "/message/") -> str:
     rows = "\n".join(
         (
