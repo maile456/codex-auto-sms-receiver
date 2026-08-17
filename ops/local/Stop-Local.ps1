@@ -94,6 +94,12 @@ function Test-ServiceHealth {
 }
 
 function Invoke-StopLocal {
+    if (-not (Test-Path -LiteralPath $script:PythonPath -PathType Leaf)) {
+        $systemPython = Get-Command python.exe -ErrorAction SilentlyContinue
+        if ($null -ne $systemPython -and (Test-Path -LiteralPath $systemPython.Source -PathType Leaf)) {
+            $script:PythonPath = [IO.Path]::GetFullPath($systemPython.Source)
+        }
+    }
     $serverProcessId = Get-ServerProcessId
     if ($null -eq $serverProcessId) {
         if (Test-ServiceHealth) {

@@ -262,6 +262,58 @@ def test_code_url_can_be_opened_directly_from_local_inventory(workspace_path: Pa
     assert "toast('邮箱已复制')" in html
 
 
+def test_integration_submit_and_status_expose_no_credentials(workspace_path: Path):
+    client, mailbox, codex = _client(workspace_path)
+    secret_url = "https://mail.test/code?token=mail-secret"
+    mailbox.import_text("code_url", f"owner@example.com----{secret_url}")
+
+    submitted = client.post(
+        "/api/v1/integration/accounts/submit",
+        json={"email": "owner@example.com"},
+    )
+
+    assert submitted.status_code == 202
+    body = submitted.get_json()
+    assert body["started"] is True
+    assert body["account"]["state"] == "queued"
+    assert body["account"]["credential_ready"] is False
+    assert codex.jobs[0]["email"] == "owner@example.com"
+    serialized = json.dumps(body, ensure_ascii=False)
+    assert "mail-secret" not in serialized
+    assert "code_url" not in serialized
+    assert "credential_path" not in serialized
+
+    status = client.get(
+        "/api/v1/integration/accounts/status?email=owner%40example.com"
+    )
+    assert status.status_code == 200
+    assert status.get_json()["account"]["state"] == "queued"
+
+    duplicate = client.post(
+        "/api/v1/integration/accounts/submit",
+        json={"email": "owner@example.com"},
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.get_json()["started"] is False
+    assert len(codex.jobs) == 1
+
+
+def test_integration_api_validates_email_and_missing_account(workspace_path: Path):
+    client, _, _ = _client(workspace_path)
+
+    assert client.post(
+        "/api/v1/integration/accounts/submit", json={}
+    ).status_code == 400
+    assert client.get("/api/v1/integration/accounts/status").status_code == 400
+    assert client.post(
+        "/api/v1/integration/accounts/submit",
+        json={"email": "missing@example.com"},
+    ).status_code == 404
+    assert client.get(
+        "/api/v1/integration/accounts/status?email=missing%40example.com"
+    ).status_code == 404
+
+
 def test_phone_status_is_exposed_and_unverified_accounts_export_original_format(
     workspace_path: Path,
 ):

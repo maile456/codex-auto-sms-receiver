@@ -201,6 +201,63 @@ def create_app(
             row["recent_task"] = _safe_recent_task((recent or {}).get("job"))
         return rows
 
+    def _integration_account_status(email: str) -> dict | None:
+        account = mailbox_store.get_secret(email=email)
+        if account is None:
+            return None
+        latest_getter = getattr(codex_manager, "latest_job_for_email", None)
+        if callable(latest_getter):
+            recent = latest_getter(str(account.get("email") or email))
+        else:
+            target = str(account.get("email") or email).strip().casefold()
+            candidates = [
+                item
+                for item in codex_manager.list_jobs()
+                if str(item.get("email") or "").strip().casefold() == target
+            ]
+            recent = max(candidates, key=_task_observed) if candidates else None
+        recent = _safe_recent_task(recent) if isinstance(recent, dict) else None
+        credential_ready = bool(account.get("credential_path"))
+        raw_state = str(
+            (recent or {}).get("status") or account.get("codex_status") or "idle"
+        ).strip().lower()
+        state_aliases = {
+            "success": "ready" if credential_ready else "completed",
+            "completed": "ready" if credential_ready else "completed",
+            "pending": "queued",
+        }
+        state = state_aliases.get(raw_state, raw_state)
+        if credential_ready:
+            state = "ready"
+        elif state not in {
+            "idle",
+            "queued",
+            "running",
+            "retry_wait",
+            "paused",
+            "completed",
+            "failed",
+            "stopped",
+        }:
+            state = "idle"
+        task = None
+        if recent:
+            task = {
+                key: recent.get(key)
+                for key in ("id", "status", "stage", "message", "updated_at")
+                if recent.get(key) not in (None, "")
+            }
+        return {
+            "email": str(account.get("email") or email),
+            "state": state,
+            "credential_ready": credential_ready,
+            "phone_verified": bool(account.get("phone_verified")),
+            "updated_at": str(
+                (recent or {}).get("updated_at") or account.get("updated_at") or ""
+            ),
+            "task": task,
+        }
+
     def _pipeline_overview():
         getter = getattr(codex_manager, "pipeline_overview", None)
         if callable(getter):
@@ -276,6 +333,50 @@ def create_app(
     @app.get("/api/accounts")
     def list_accounts():
         return jsonify({"ok": True, "accounts": _account_rows()})
+
+    @app.post("/api/v1/integration/accounts/submit")
+    def integration_submit_account():
+        data = request.get_json(silent=True)
+        email = str((data or {}).get("email") or "").strip()
+        if not isinstance(data, dict) or not email or len(email) > 320 or "@" not in email:
+            return jsonify({"ok": False, "error": "invalid_email"}), 400
+        status = _integration_account_status(email)
+        if status is None:
+            return jsonify({"ok": False, "error": "account_not_found"}), 404
+        if status["credential_ready"] or status["state"] in {
+            "queued",
+            "running",
+            "retry_wait",
+            "paused",
+        }:
+            return jsonify({"ok": True, "started": False, "account": status})
+        try:
+            codex_manager.start(status["email"])
+        except Exception as exc:
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "job_start_failed",
+                    "error_type": type(exc).__name__,
+                }
+            ), 409
+        return jsonify(
+            {
+                "ok": True,
+                "started": True,
+                "account": _integration_account_status(status["email"]),
+            }
+        ), 202
+
+    @app.get("/api/v1/integration/accounts/status")
+    def integration_account_status():
+        email = str(request.args.get("email") or "").strip()
+        if not email or len(email) > 320 or "@" not in email:
+            return jsonify({"ok": False, "error": "invalid_email"}), 400
+        status = _integration_account_status(email)
+        if status is None:
+            return jsonify({"ok": False, "error": "account_not_found"}), 404
+        return jsonify({"ok": True, "account": status})
 
     @app.post("/api/accounts/<account_id>/material/reveal")
     def reveal_account_material(account_id: str):

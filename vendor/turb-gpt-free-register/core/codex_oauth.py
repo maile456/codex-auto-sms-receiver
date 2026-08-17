@@ -1491,15 +1491,16 @@ def run_codex_oauth(
         oauth_driver = str(getattr(_codex_cfg, "CODEX_OAUTH_DRIVER", "protocol") or "protocol").strip().lower()
         if oauth_driver == "same_as_registration":
             oauth_driver = str(getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
-        if password_totp_login and oauth_driver not in ("protocol", "api", "http"):
-            return _codex_result(
-                status="failed",
-                email=email,
-                message="密码 + TOTP 登录当前仅支持 protocol 驱动",
-            )
         if oauth_driver in ("roxy", "roxybrowser", "fingerprint", "browser"):
             from core.roxy_codex_oauth import run_roxy_codex_oauth
-            return run_roxy_codex_oauth(email, otp_provider=otp_provider, proxy=proxy, force=True)
+            return run_roxy_codex_oauth(
+                email,
+                otp_provider=otp_provider,
+                proxy=proxy,
+                force=True,
+                password=password,
+                totp_provider=totp_provider,
+            )
         if oauth_driver in ("browser_use", "browseruse", "browser-use", "bu"):
             from core.browser_use_codex_oauth import run_browser_use_codex_oauth
             return run_browser_use_codex_oauth(email, otp_provider=otp_provider, proxy=proxy, force=True)

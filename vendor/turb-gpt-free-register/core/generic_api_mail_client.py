@@ -343,7 +343,10 @@ def _extract_structured_code_payload(
     after_ts: float | None = None,
 ) -> tuple[bool, str | None]:
     """
-    解析 ``{ok, code, mail, email, fetched_at}`` 风格的取码响应。
+    解析常见的结构化取码响应。
+
+    支持 ``{ok, code, mail, email, fetched_at}`` 以及 MailCom Hub 的
+    ``{ok, found, verification_code, receivedAt, message}`` 格式。
 
     ``fetched_at`` 只是查询时间，不能证明验证码属于本轮登录；启用
     ``after_ts`` 时必须以 mail 或顶层邮件时间字段判断新鲜度。
@@ -354,14 +357,31 @@ def _extract_structured_code_payload(
         return False, None
     if not isinstance(payload, dict):
         return False, None
-    if "code" not in payload or not (
+    legacy_payload = "code" in payload and (
         "ok" in payload or "mail" in payload or "fetched_at" in payload
-    ):
+    )
+    mailcom_payload = (
+        "verification_code" in payload
+        or "verificationCode" in payload
+        or (
+            "found" in payload
+            and "message" in payload
+            and ("ok" in payload or "receivedAt" in payload)
+        )
+    )
+    if not (legacy_payload or mailcom_payload):
         return False, None
     if payload.get("ok") is False:
         raise GenericApiMailError("取码接口返回失败状态，请检查邮箱或 API Key")
 
+    message_payload = payload.get("message")
     raw_code = payload.get("code")
+    if mailcom_payload:
+        raw_code = payload.get("verification_code") or payload.get("verificationCode")
+        if not raw_code and isinstance(message_payload, dict):
+            raw_code = message_payload.get("verificationCode") or message_payload.get(
+                "verification_code"
+            )
     code = str(raw_code or "").strip()
     if not code:
         return True, None
@@ -371,6 +391,8 @@ def _extract_structured_code_payload(
         return True, code
 
     mail_payload = payload.get("mail")
+    if mail_payload is None and mailcom_payload:
+        mail_payload = message_payload
     received_ts = _parse_message_timestamp(mail_payload)
     if received_ts is None:
         received_ts = _parse_message_timestamp(payload)

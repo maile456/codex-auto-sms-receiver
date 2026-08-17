@@ -40,6 +40,23 @@ def _parse_time(value: Any) -> float:
 _PHONE_ATTEMPT = re.compile(r"手机验证尝试\s+\d+\s*/\s*\d+.*?号码=\+?(\d{7,15})")
 
 
+def _project_env(project_root: Path, name: str, default: str = "") -> str:
+    """Read a setting from the process first, then the receiver .env file."""
+    value = os.getenv(name)
+    if value not in (None, ""):
+        return str(value)
+    try:
+        from dotenv import dotenv_values
+
+        loaded = dotenv_values(project_root / ".env")
+        raw = loaded.get(name)
+        if raw not in (None, ""):
+            return str(raw)
+    except Exception:
+        pass
+    return default
+
+
 class CodexJobManager:
     """Persistent batch scheduler for existing-account Codex OAuth jobs."""
 
@@ -84,16 +101,18 @@ class CodexJobManager:
         missing = [name for name in ("curl_cffi", "Crypto", "pyotp") if importlib.util.find_spec(name) is None]
         if missing:
             return {"available": False, "reason": "缺少依赖：" + ", ".join(missing)}
-        driver = (os.getenv("CODEX_OAUTH_DRIVER", "protocol") or "protocol").strip().lower()
-        auth_source = (os.getenv("CODEX_AUTH_URL_SOURCE", "local") or "local").strip().lower()
-        if driver not in {"protocol", "api", "http"}:
-            return {"available": False, "reason": "此独立项目仅支持 CODEX_OAUTH_DRIVER=protocol"}
-        if auth_source == "cpa" and not os.getenv("CPA_MANAGEMENT_KEY", "").strip():
+        driver = _project_env(self.settings.project_root, "CODEX_OAUTH_DRIVER", "protocol").strip().lower()
+        auth_source = _project_env(self.settings.project_root, "CODEX_AUTH_URL_SOURCE", "local").strip().lower()
+        if driver not in {"protocol", "api", "http", "roxy", "roxybrowser", "fingerprint", "browser"}:
+            return {"available": False, "reason": f"不支持的 OAuth 驱动：{driver}"}
+        if auth_source == "cpa" and not _project_env(self.settings.project_root, "CPA_MANAGEMENT_KEY").strip():
             return {"available": False, "reason": "CPA 模式缺少 CPA_MANAGEMENT_KEY"}
-        if not reauth and not os.getenv("HERO_SMS_API_KEY", "").strip():
+        if not reauth and not _project_env(self.settings.project_root, "HERO_SMS_API_KEY").strip():
             return {"available": False, "reason": "Hero SMS 缺少 HERO_SMS_API_KEY"}
         try:
-            countries = normalize_hero_countries(os.getenv("HERO_SMS_COUNTRIES", ""))
+            countries = normalize_hero_countries(
+                _project_env(self.settings.project_root, "HERO_SMS_COUNTRIES")
+            )
         except ValueError:
             countries = []
         if not reauth and not countries:
@@ -102,8 +121,8 @@ class CodexJobManager:
 
     def runtime_config(self) -> dict:
         return {
-            "driver": "protocol",
-            "auth_source": os.getenv("CODEX_AUTH_URL_SOURCE", "local") or "local",
+            "driver": _project_env(self.settings.project_root, "CODEX_OAUTH_DRIVER", "protocol"),
+            "auth_source": _project_env(self.settings.project_root, "CODEX_AUTH_URL_SOURCE", "local") or "local",
             "sms_provider": "hero",
             "outlook_fetch_mode": os.getenv("OUTLOOK_FETCH_MODE", "direct") or "direct",
             "pipeline_max_concurrency": self._max_concurrency(),
@@ -294,6 +313,31 @@ class CodexJobManager:
             rows = [self._public_job(item) for item in self._jobs.values()]
         rows.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return rows[:500]
+
+    def latest_job_for_email(self, email: str) -> dict | None:
+        """Return one public job without materializing every account's history."""
+
+        target = str(email or "").strip().casefold()
+        if not target:
+            return None
+        with self._lock:
+            candidates = [
+                item
+                for item in self._jobs.values()
+                if str(item.get("email") or "").strip().casefold() == target
+            ]
+            selected = max(
+                candidates,
+                key=lambda item: str(
+                    item.get("updated_at")
+                    or item.get("finished_at")
+                    or item.get("started_at")
+                    or item.get("created_at")
+                    or ""
+                ),
+                default=None,
+            )
+            return self._public_job(selected) if selected is not None else None
 
     def _pipeline_public_locked(self, pipeline: dict[str, Any]) -> dict[str, Any]:
         job_ids = [str(value) for value in pipeline.get("job_ids") or []]
@@ -611,7 +655,14 @@ class CodexJobManager:
             text = Path(path).read_text(encoding="utf-8", errors="replace")
         except OSError:
             return ""
-        if "手机号验证通过" not in text:
+        phone_success = (
+            "手机号验证通过" in text
+            or (
+                "手机 OTP 提交后状态：left_phone_flow" in text
+                and "已标记完成 activation_id=" in text
+            )
+        )
+        if not phone_success:
             return ""
         matches = _PHONE_ATTEMPT.findall(text)
         return f"+{matches[-1]}" if matches else ""

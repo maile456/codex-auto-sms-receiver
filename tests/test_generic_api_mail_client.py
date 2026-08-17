@@ -550,3 +550,90 @@ def test_structured_api_accepts_valid_code_without_mail_when_after_ts_is_none():
     )
 
     assert code == "345678"
+
+
+def test_mailcom_hub_accepts_fresh_verification_code():
+    payload = {
+        "ok": True,
+        "email": "owner@example.test",
+        "found": True,
+        "verification_code": "654321",
+        "receivedAt": "2026-08-17T08:44:30+08:00",
+        "message": {
+            "subject": "ChatGPT verification code",
+            "verificationCode": "654321",
+            "receivedAt": "2026-08-17T08:44:30+08:00",
+        },
+    }
+    session = FakeSession(
+        {
+            STRUCTURED_API_URL: _structured_api_response(payload),
+        }
+    )
+    after_ts = datetime(
+        2026, 8, 17, 8, 44, 25, tzinfo=timezone(timedelta(hours=8))
+    ).timestamp()
+
+    code = mail_client._fetch_current_code(
+        session,
+        STRUCTURED_API_URL,
+        HEADERS,
+        after_ts=after_ts,
+    )
+
+    assert code == "654321"
+
+
+def test_mailcom_hub_rejects_stale_verification_code():
+    payload = {
+        "ok": True,
+        "email": "owner@example.test",
+        "found": True,
+        "verification_code": "123456",
+        "receivedAt": "2026-08-17T08:40:00+08:00",
+        "message": {
+            "verificationCode": "123456",
+            "receivedAt": "2026-08-17T08:40:00+08:00",
+        },
+    }
+    session = FakeSession(
+        {
+            STRUCTURED_API_URL: _structured_api_response(payload),
+        }
+    )
+    after_ts = datetime(
+        2026, 8, 17, 8, 44, 25, tzinfo=timezone(timedelta(hours=8))
+    ).timestamp()
+
+    code = mail_client._fetch_current_code(
+        session,
+        STRUCTURED_API_URL,
+        HEADERS,
+        after_ts=after_ts,
+    )
+
+    assert code is None
+
+
+def test_mailcom_hub_empty_mail_is_recognized_without_scanning_metadata():
+    payload = {
+        "ok": True,
+        "email": "owner-654321@example.test",
+        "found": False,
+        "verification_code": None,
+        "receivedAt": None,
+        "message": None,
+    }
+    session = FakeSession(
+        {
+            STRUCTURED_API_URL: _structured_api_response(payload),
+        }
+    )
+
+    code = mail_client._fetch_current_code(
+        session,
+        STRUCTURED_API_URL,
+        HEADERS,
+    )
+
+    assert code is None

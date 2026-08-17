@@ -209,6 +209,80 @@ def _maybe_click_passwordless_after_email(driver, email: str, timeout: int = 18)
         logger.info("[Codex][Browser] 已点击一次性验证码入口，未立即检测到 OTP 页，继续后续 OTP 轮询")
 
 
+def _fill_email_password_and_totp(
+    driver,
+    email: str,
+    password: str,
+    totp_provider,
+    auth_url: str,
+) -> None:
+    """Complete an existing-account email → password → TOTP browser flow."""
+    logger.info("[Codex][Roxy] 打开密码 + TOTP 授权地址")
+    driver.get(auth_url)
+    human_delay("navigate")
+    _maybe_accept(driver)
+    _type_email_address(driver, email, timeout=20)
+    _submit_email_step(driver)
+    logger.info("[Codex][Roxy] 已提交邮箱，等待密码页")
+
+    password_selectors = [
+        "input[type='password']",
+        "input[name='password']",
+        "input[autocomplete='current-password']",
+        "input[id*='password' i]",
+    ]
+    try:
+        _type_any(driver, password_selectors, password, timeout=25)
+    except Exception:
+        logger.info("[Codex][Roxy] 未找到密码输入框，继续检查后续授权页面")
+        return
+    human_delay("form")
+    clicked = _click_if_present(
+        driver,
+        [
+            "button[type='submit']",
+            "//button[contains(., 'Continue')]",
+            "//button[contains(., '继续')]",
+        ],
+        timeout=10,
+    )
+    logger.info("[Codex][Roxy] 密码已提交：button_clicked=%s", clicked)
+    human_delay("api")
+
+    totp_selectors = [
+        "input[autocomplete='one-time-code']",
+        "input[inputmode='numeric']",
+        "input[name*='totp' i]",
+        "input[name*='otp' i]",
+        "input[name*='code' i]",
+        "input[id*='code' i]",
+    ]
+    code_input = _find_any(driver, totp_selectors, timeout=30)
+    code = str(totp_provider() or "").strip()
+    if not code:
+        raise RuntimeError("TOTP provider returned an empty code")
+    try:
+        code_input.clear()
+    except Exception:
+        pass
+    code_input.send_keys(code)
+    logger.info("[Codex][Roxy] 已填写 TOTP 验证码")
+    human_delay("otp_input")
+    if not _click_if_present(
+        driver,
+        [
+            "button[type='submit']",
+            "//button[contains(., 'Continue')]",
+            "//button[contains(., '继续')]",
+            "//button[contains(., 'Verify')]",
+            "//button[contains(., '验证')]",
+        ],
+        timeout=10,
+    ):
+        logger.info("[Codex][Roxy] 未找到 TOTP 提交按钮，等待页面自行跳转")
+    human_delay("api")
+
+
 def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None:
     otp_after_ts = time.time()
     logger.info("[Codex][Browser] 打开授权地址")
@@ -757,10 +831,20 @@ def _set_phone_value(driver, phone: str, *, timeout: int = 10) -> dict:
     visible_digits = ''.join(ch for ch in visible_value if ch.isdigit())
     e164_digits = ''.join(ch for ch in e164 if ch.isdigit())
     hidden_digits = ''.join(ch for ch in hidden_value if ch.isdigit())
-    expected_visible_ok = bool(actual_digits) and (actual_digits == visible_digits or actual_digits == e164_digits)
-    if not expected_visible_ok:
+    hidden_ok = not hidden_value or hidden_digits == e164_digits
+    # React-Aria may briefly render a national number without its final
+    # digit while the hidden E.164 field already contains the full value.
+    # The hidden field is what the form submits, so accept that transient
+    # display state when it is exact and only reject a conflicting value.
+    expected_visible_ok = bool(actual_digits) and (
+        actual_digits == visible_digits
+        or actual_digits == e164_digits
+        or visible_digits.endswith(actual_digits)
+        or e164_digits.endswith(actual_digits)
+    )
+    if not expected_visible_ok and not hidden_ok:
         raise RuntimeError(f"手机号可见输入框校验失败 expected_digits={visible_digits or e164_digits} actual={actual} result={result} state={_phone_page_state(driver)}")
-    if hidden_value and hidden_digits != e164_digits:
+    if not hidden_ok:
         raise RuntimeError(f"手机号隐藏字段校验失败 expected={e164} actual={hidden_value} result={result} state={_phone_page_state(driver)}")
     return result
 
@@ -1197,6 +1281,8 @@ def clear_roxy_browser_auth_state(driver) -> None:
 def _run_roxy_codex_oauth_once(
     email: str,
     otp_provider=None,
+    password: str | None = None,
+    totp_provider=None,
     proxy: str | None = None,
     force: bool = False,
     existing_driver=None,
@@ -1252,7 +1338,16 @@ def _run_roxy_codex_oauth_once(
         if reuse_existing_profile and clear_existing_state:
             clear_roxy_browser_auth_state(driver)
 
-        _fill_email_and_otp(driver, email, otp_provider, auth_url)
+        if password and callable(totp_provider):
+            _fill_email_password_and_totp(
+                driver,
+                email,
+                str(password),
+                totp_provider,
+                auth_url,
+            )
+        else:
+            _fill_email_and_otp(driver, email, otp_provider, auth_url)
         human_delay("api")
         logger.info("[Codex][Browser] 检查是否需要手机号验证")
         _do_phone_verification_if_present(driver)
@@ -1349,6 +1444,8 @@ def _run_roxy_codex_oauth_once(
 def run_roxy_codex_oauth(
     email: str,
     otp_provider=None,
+    password: str | None = None,
+    totp_provider=None,
     proxy: str | None = None,
     force: bool = False,
     existing_driver=None,
@@ -1370,6 +1467,8 @@ def run_roxy_codex_oauth(
         result = _run_roxy_codex_oauth_once(
             email=email,
             otp_provider=otp_provider,
+            password=password,
+            totp_provider=totp_provider,
             proxy=proxy,
             force=force,
             existing_driver=existing_driver,

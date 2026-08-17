@@ -42,11 +42,13 @@ def _load_runtime_environment(settings: Settings) -> None:
         for key, value in dotenv_values(env_path).items():
             if key and value is not None:
                 os.environ[str(key)] = str(value)
-    # Hero SMS is the only supported provider in this login-only project.
-    # Force the protocol/login-only selectors after loading .env so stale
-    # settings or inherited variables cannot route a job to an unbundled
-    # browser or registration-oriented driver.
-    os.environ["CODEX_OAUTH_DRIVER"] = "protocol"
+    # Hero SMS remains the only supported SMS provider.  Keep the OAuth
+    # driver configurable: protocol requests are currently challenged by
+    # Cloudflare, while the local Roxy driver can complete the same flow in
+    # a real browser session.
+    os.environ["CODEX_OAUTH_DRIVER"] = str(
+        os.getenv("CODEX_OAUTH_DRIVER", "protocol") or "protocol"
+    ).strip().lower()
     os.environ["SMS_PROVIDER"] = "hero"
     os.environ["SMS_SERVICE"] = "dr"
     os.environ.pop("SMS_PROVIDER_ORDER", None)

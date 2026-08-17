@@ -114,7 +114,12 @@ function Open-LocalWebUi {
 
 function Invoke-StartLocal {
     if (-not (Test-Path -LiteralPath $script:PythonPath -PathType Leaf)) {
-        throw "未找到项目虚拟环境：$script:PythonPath。请先完成本地部署。"
+        $systemPython = Get-Command python.exe -ErrorAction SilentlyContinue
+        if ($null -eq $systemPython -or -not (Test-Path -LiteralPath $systemPython.Source -PathType Leaf)) {
+            throw "未找到项目虚拟环境或系统 Python。请先完成本地部署。"
+        }
+        $script:PythonPath = [IO.Path]::GetFullPath($systemPython.Source)
+        Write-Host "[提示] 项目虚拟环境不存在，使用系统 Python：$script:PythonPath" -ForegroundColor Yellow
     }
     if (-not (Test-Path -LiteralPath $script:EnvPath -PathType Leaf)) {
         throw "未找到本地配置：$script:EnvPath。请先从 .env.example 创建 .env。"
