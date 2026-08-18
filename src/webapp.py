@@ -4,6 +4,7 @@ import ipaddress
 import io
 import json
 import base64
+import re
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -247,11 +248,23 @@ def create_app(
                 for key in ("id", "status", "stage", "message", "updated_at")
                 if recent.get(key) not in (None, "")
             }
+        phone_number = str(account.get("phone_number") or "")
+        phone_verified_at = account.get("phone_verified_at")
+        if not phone_number:
+            phone_lookup = getattr(artifact_store, "phone_verification_for_account", None)
+            if callable(phone_lookup):
+                verified = phone_lookup(
+                    str(account.get("id") or account.get("_id") or "")
+                ) or {}
+                phone_number = str(verified.get("phone_number") or "")
+                phone_verified_at = verified.get("phone_verified_at")
         return {
             "email": str(account.get("email") or email),
             "state": state,
             "credential_ready": credential_ready,
-            "phone_verified": bool(account.get("phone_verified")),
+            "phone_verified": bool(account.get("phone_verified") or phone_number),
+            "phone_number": phone_number,
+            "phone_verified_at": phone_verified_at,
             "updated_at": str(
                 (recent or {}).get("updated_at") or account.get("updated_at") or ""
             ),
@@ -925,6 +938,28 @@ def create_app(
             "accounts": accounts,
         }
 
+    def _sub2api_split_bytes(rows: list[tuple[Path, str]]) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for index, row in enumerate(rows, start=1):
+                payload = _sub2api_payload([row])
+                account = (payload.get("accounts") or [{}])[0]
+                email = str(account.get("name") or row[0].stem)
+                safe_name = re.sub(r"[^A-Za-z0-9._@-]+", "-", email).strip(".-")
+                archive.writestr(
+                    f"{index:03d}-{safe_name or 'account'}.json",
+                    (
+                        json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+                    ).encode("utf-8"),
+                )
+            archive.writestr(
+                "README.txt",
+                "每个 JSON 文件只包含一个 Sub2 API 账号，可独立导入。\n".encode(
+                    "utf-8"
+                ),
+            )
+        return buffer.getvalue()
+
     def _original_accounts_bytes(account_ids: list[str]) -> bytes:
         grouped = mailbox_store.export_original(account_ids)
         buffer = io.BytesIO()
@@ -953,7 +988,10 @@ def create_app(
         if not isinstance(requested, list) or not requested:
             raise ValueError("请至少选择一种导出格式")
         formats = list(dict.fromkeys(str(value or "").strip().lower() for value in requested))
-        if any(value not in {"original", "codex_json", "sub2api"} for value in formats):
+        if any(
+            value not in {"original", "codex_json", "sub2api", "sub2api_split"}
+            for value in formats
+        ):
             raise ValueError("不支持的账号导出格式")
         return formats
 
@@ -976,6 +1014,8 @@ def create_app(
                     json.dumps(_sub2api_payload(rows), ensure_ascii=False, indent=2).encode("utf-8")
                     + b"\n"
                 )
+            if "sub2api_split" in credential_formats:
+                parts["sub2api-separate.zip"] = _sub2api_split_bytes(rows)
         if len(parts) == 1:
             part_name, content = next(iter(parts.items()))
             return content, f"account-inventory-{scope}-{part_name}", (
@@ -998,6 +1038,8 @@ def create_app(
                 json.dumps(_sub2api_payload(rows), ensure_ascii=False, indent=2).encode("utf-8")
                 + b"\n"
             )
+        if "sub2api_split" in formats:
+            parts["sub2api-separate.zip"] = _sub2api_split_bytes(rows)
         if len(parts) == 1:
             part_name, content = next(iter(parts.items()))
             return content, f"{scope}-{part_name}", (
